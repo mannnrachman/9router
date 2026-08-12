@@ -194,22 +194,11 @@ export function parseGrokCliBilling(billing, user = null) {
       total: onDemandCap,
       resetAt: periodEnd,
     });
-  } else if (
-    !subscriptionAccess &&
-    Number.isFinite(onDemandCap) &&
-    onDemandCap === 0 &&
-    Number.isFinite(onDemandUsed)
-  ) {
-    // Cap 0 is the exhausted free/promo state (chat returns 402 spending-limit).
-    // UI treats total===0 as unlimited, so use a synthetic 1/1 depleted row.
-    quotas["On-demand"] = {
-      used: 1,
-      total: 1,
-      remainingPercentage: 0,
-      resetAt: periodEnd,
-      unlimited: false,
-    };
   }
+  // NOTE: cap=0 (no on-demand window) is no longer rendered as a depleted red
+  // row — accounts with hasGrokCodeAccess (promo/code-access tier) report
+  // cap=0 while chat works fine. Pre-v0.5.45 pattern: no usable billing data
+  // => no red row.
 
   // Prepaid top-up balance (remaining credits; no fixed allotment known)
   const prepaid = unwrapVal(config.prepaidBalance ?? root.prepaidBalance, NaN);

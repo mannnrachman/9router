@@ -67,6 +67,11 @@ function sortConnections(connections, sort) {
   }
 
   return list.sort((a, b) => {
+    // Pin grok-cli (thousands of accounts) to the end of the list so other
+    // providers stay visible without scrolling.
+    const aGrok = a.provider === "grok-cli";
+    const bGrok = b.provider === "grok-cli";
+    if (aGrok !== bGrok) return aGrok ? 1 : -1;
     const priorityA = a.priority ?? Number.MAX_SAFE_INTEGER;
     const priorityB = b.priority ?? Number.MAX_SAFE_INTEGER;
     if (priorityA !== priorityB) return priorityA - priorityB;
