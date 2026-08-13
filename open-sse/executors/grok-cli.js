@@ -309,8 +309,13 @@ function normalizeGrokCliTools(body) {
   if (body.tools.length === 0) {
     delete body.tools;
     delete body.tool_choice;
+    delete body.parallel_tool_calls;
     return;
   }
+
+  // Grok CLI may batch function calls even when the client describes a
+  // sequential shell workflow. One call per turn keeps side effects ordered.
+  body.parallel_tool_calls = false;
 
   if (body.tool_choice && typeof body.tool_choice === "object" && !Array.isArray(body.tool_choice)) {
     const choiceType = typeof body.tool_choice.type === "string" ? body.tool_choice.type : "";
