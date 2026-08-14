@@ -12,6 +12,25 @@ import {
   encodeMcpTools,
   decodeMcpArgs,
   encodeMcpResultSuccess,
+  decodeExecServerEvent,
+  encodeAgentNativeRejection,
+  encodeAgentEmptyListMcpResources,
+  encodeAgentHeartbeat,
+  decodeAgentKvServerEvent,
+  encodeAgentKvGetResult,
+  encodeAgentKvSetResult,
+  decodeAgentInteractionQuery,
+  encodeAgentInteractionResponse,
+  encodeAgentReadSuccess,
+  encodeAgentGrepSuccess,
+  encodeAgentLsSuccess,
+  encodeAgentDiagnosticsSuccess,
+  encodeAgentFetchSuccess,
+  encodeAgentWriteSuccess,
+  encodeAgentDeleteSuccess,
+  encodeAgentShellSuccess,
+  encodeAgentShellFailure,
+  encodeAgentShellTimeout,
 } from "../utils/cursorProtobuf.js";
 import { buildCursorHeaders } from "../utils/cursorChecksum.js";
 import { estimateUsage } from "../utils/usageTracking.js";
@@ -21,6 +40,159 @@ import { FORMATS } from "../translator/formats.js";
 import { proxyAwareFetch } from "../utils/proxyFetch.js";
 import { resolveCursorModel, resolveCursorModelSelection } from "../services/cursorModels.js";
 import zlib from "zlib";
+import { promises as fs } from "node:fs";
+import { spawn } from "node:child_process";
+import path from "node:path";
+
+// Native IDE tool execution. Read-only tools (read/grep/ls/diagnostics/fetch)
+// always run inside CURSOR_WORKSPACE (default: server cwd). Mutating tools
+// (write/delete/shell) require CURSOR_NATIVE_EXEC=1.
+const NATIVE_WORKSPACE = path.resolve(process.env.CURSOR_WORKSPACE || process.cwd());
+const NATIVE_EXEC_MUTATE = process.env.CURSOR_NATIVE_EXEC === "1";
+const NATIVE_READ_CAP = Number(process.env.CURSOR_READ_CAP) || 1024 * 1024;
+const NATIVE_SHELL_TIMEOUT_MS = Number(process.env.CURSOR_SHELL_TIMEOUT_MS) || 30000;
+const NATIVE_GREP_MAX = 500;
+const NATIVE_LS_MAX = 500;
+
+function inWorkspace(p) {
+  const resolved = path.resolve(p || "");
+  return resolved === NATIVE_WORKSPACE || resolved.startsWith(NATIVE_WORKSPACE + path.sep);
+}
+
+async function readFileSafe(p) {
+  const buf = await fs.readFile(p);
+  const truncated = buf.length > NATIVE_READ_CAP;
+  const slice = truncated ? buf.subarray(0, NATIVE_READ_CAP) : buf;
+  return { text: slice.toString("utf8"), truncated, size: buf.length };
+}
+
+async function* walkFiles(dir, { depth = 0, maxDepth = 4, cap = NATIVE_GREP_MAX } = {}) {
+  if (depth > maxDepth) return;
+  let entries;
+  try { entries = await fs.readdir(dir, { withFileTypes: true }); } catch { return; }
+  for (const e of entries) {
+    if (e.name === ".git" || e.name === "node_modules" || e.name.startsWith(".")) continue;
+    const full = path.join(dir, e.name);
+    if (e.isDirectory()) yield* walkFiles(full, { depth: depth + 1, maxDepth, cap });
+    else if (e.isFile()) { yield full; if (--cap <= 0) return; }
+  }
+}
+
+async function execNativeTool(execEvent, session) {
+  const { kind } = execEvent;
+  const reply = (buf) => buf && session.write(buf);
+  try {
+    switch (kind) {
+      case "exec_read": {
+        if (!inWorkspace(execEvent.path)) return reply(encodeAgentNativeRejection(execEvent, "Path is outside the allowed workspace"));
+        const { text, truncated, size } = await readFileSafe(execEvent.path);
+        return reply(encodeAgentReadSuccess(execEvent.execMsgId, execEvent.execId, { path: execEvent.path, content: text, truncated, fileSize: size }));
+      }
+      case "exec_grep": {
+        if (execEvent.path && !inWorkspace(execEvent.path)) return reply(encodeAgentNativeRejection(execEvent, "Path is outside the allowed workspace"));
+        const root = execEvent.path || NATIVE_WORKSPACE;
+        const flags = execEvent.caseInsensitive ? "i" : "";
+        let re;
+        try { re = new RegExp(execEvent.pattern, flags); } catch { return reply(encodeAgentNativeRejection(execEvent, `Invalid regex: ${execEvent.pattern}`)); }
+        const matches = [];
+        for await (const file of walkFiles(root)) {
+          if (matches.length >= NATIVE_GREP_MAX) break;
+          let text;
+          try { text = (await fs.readFile(file, "utf8")).slice(0, NATIVE_READ_CAP); } catch { continue; }
+          const lines = [];
+          text.split("\n").forEach((line, i) => { if (re.test(line)) lines.push({ lineNumber: i + 1, content: line }); });
+          if (lines.length) matches.push({ file, lines });
+        }
+        return reply(encodeAgentGrepSuccess(execEvent.execMsgId, execEvent.execId, { pattern: execEvent.pattern, path: path.relative(NATIVE_WORKSPACE, root) || ".", matches, truncated: matches.length >= NATIVE_GREP_MAX }));
+      }
+      case "exec_ls": {
+        if (execEvent.path && !inWorkspace(execEvent.path)) return reply(encodeAgentNativeRejection(execEvent, "Path is outside the allowed workspace"));
+        const root = execEvent.path || NATIVE_WORKSPACE;
+        const files = [], dirs = [];
+        let entries;
+        try { entries = await fs.readdir(root, { withFileTypes: true }); } catch (e) { return reply(encodeAgentNativeRejection(execEvent, `Cannot read dir: ${e.message}`)); }
+        for (const e of entries) {
+          if (files.length + dirs.length >= NATIVE_LS_MAX) break;
+          if (e.name.startsWith(".")) continue;
+          if (e.isDirectory()) dirs.push(e.name); else if (e.isFile()) files.push(e.name);
+        }
+        return reply(encodeAgentLsSuccess(execEvent.execMsgId, execEvent.execId, { path: root, files, dirs, numFiles: files.length, truncated: files.length + dirs.length >= NATIVE_LS_MAX }));
+      }
+      case "exec_diagnostics":
+        // No linter on the server; empty success means "no diagnostics".
+        return reply(encodeAgentDiagnosticsSuccess(execEvent.execMsgId, execEvent.execId, execEvent.path || ""));
+      case "exec_fetch": {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 30000);
+        try {
+          const res = await fetch(execEvent.url, { signal: controller.signal, redirect: "follow" });
+          const text = (await res.text()).slice(0, NATIVE_READ_CAP);
+          return reply(encodeAgentFetchSuccess(execEvent.execMsgId, execEvent.execId, { url: execEvent.url, content: text, statusCode: res.status, contentType: res.headers.get("content-type") || "" }));
+        } finally { clearTimeout(timer); }
+      }
+      case "exec_write":
+      case "exec_delete":
+        if (!NATIVE_EXEC_MUTATE) return reply(encodeAgentNativeRejection(execEvent, "File mutations disabled. Set CURSOR_NATIVE_EXEC=1 to enable write/delete."));
+        if (!inWorkspace(execEvent.path)) return reply(encodeAgentNativeRejection(execEvent, "Path is outside the allowed workspace"));
+        if (kind === "exec_delete") {
+          const prev = (await fs.readFile(execEvent.path, "utf8")).slice(0, NATIVE_READ_CAP);
+          const stat = await fs.stat(execEvent.path);
+          await fs.unlink(execEvent.path);
+          return reply(encodeAgentDeleteSuccess(execEvent.execMsgId, execEvent.execId, { path: execEvent.path, deletedFile: execEvent.path, fileSize: stat.size, prevContent: prev }));
+        }
+        {
+          await fs.mkdir(path.dirname(execEvent.path), { recursive: true });
+          await fs.writeFile(execEvent.path, execEvent.fileText ?? "");
+          const stat = await fs.stat(execEvent.path);
+          return reply(encodeAgentWriteSuccess(execEvent.execMsgId, execEvent.execId, { path: execEvent.path, linesCreated: (execEvent.fileText || "").split("\n").length, fileSize: stat.size }));
+        }
+      case "exec_shell":
+        if (!NATIVE_EXEC_MUTATE) return reply(encodeAgentNativeRejection(execEvent, "Shell disabled. Set CURSOR_NATIVE_EXEC=1 to enable shell."));
+        return reply(await runNativeShell(execEvent));
+      default:
+        return reply(encodeAgentNativeRejection(execEvent));
+    }
+  } catch (e) {
+    return reply(encodeAgentNativeRejection(execEvent, `Tool failed: ${e.message}`));
+  }
+}
+
+async function runNativeShell({ execMsgId, execId, command = "", workingDir = "" }) {
+  const cwd = workingDir && inWorkspace(workingDir) ? workingDir : NATIVE_WORKSPACE;
+  const started = Date.now();
+  const child = spawn("/bin/sh", ["-c", command], { cwd, maxBuffer: NATIVE_READ_CAP });
+  let stdout = "", stderr = "";
+  const out = [], err = [];
+  child.stdout.on("data", (c) => { out.push(c); if (Buffer.concat(out).length > NATIVE_READ_CAP) child.stdout.pause(); });
+  child.stderr.on("data", (c) => { err.push(c); if (Buffer.concat(err).length > NATIVE_READ_CAP) child.stderr.pause(); });
+  const [code, error, timedOut] = await new Promise((resolve) => {
+    let settled = false;
+    const finish = (v) => { if (!settled) { settled = true; resolve(v); } };
+    const timer = setTimeout(() => {
+      try { child.kill("SIGKILL"); } catch {}
+      finish([null, null, true]);
+    }, NATIVE_SHELL_TIMEOUT_MS);
+    child.on("error", (e) => { clearTimeout(timer); finish([null, e.message, false]); });
+    child.on("close", (c) => { clearTimeout(timer); finish([c, null, false]); });
+  });
+  stdout = Buffer.concat(out).toString("utf8").slice(0, NATIVE_READ_CAP);
+  stderr = Buffer.concat(err).toString("utf8").slice(0, NATIVE_READ_CAP);
+  const executionTime = Date.now() - started;
+  if (timedOut) return encodeAgentShellTimeout(execMsgId, execId, { command, cwd, timeoutMs: NATIVE_SHELL_TIMEOUT_MS });
+  if (error) return encodeAgentShellFailure(execMsgId, execId, { command, cwd, exitCode: 1, stderr: error, executionTime });
+  return code === 0
+    ? encodeAgentShellSuccess(execMsgId, execId, { command, cwd, exitCode: code, stdout, stderr, executionTime })
+    : encodeAgentShellFailure(execMsgId, execId, { command, cwd, exitCode: code ?? 1, stdout, stderr, executionTime });
+}
+
+// Reject (or execute) a native tool request. Returns false when the message
+// was handled without a wire reply (request_context/mcp paths handled by caller).
+function handleNativeExec(execEvent, session) {
+  if (!execEvent) return false;
+  if (execEvent.kind === "exec_request_context" || execEvent.kind === "exec_mcp") return false;
+  execNativeTool(execEvent, session);
+  return true;
+}
 import crypto from "crypto";
 
 // Detect cloud environment
@@ -52,6 +224,8 @@ const PROTOBUF_LEN = 2;
 const PROTOBUF_VARINT = 0;
 
 const CURSOR_AGENT_SESSION_TTL_MS = 5 * 60 * 1000;
+const CURSOR_AGENT_STREAM_TIMEOUT_MS = Number(process.env.CURSOR_STREAM_TIMEOUT_MS || 300000);
+const CURSOR_AGENT_HEARTBEAT_MS = Number(process.env.CURSOR_HEARTBEAT_MS || 5000);
 const retainedAgentSessions = new Map();
 const retainedAgentToolCalls = new Map();
 
@@ -860,7 +1034,22 @@ export class CursorExecutor extends BaseExecutor {
     let finished = false;
 
     const consume = async (onEvent) => {
+      let heartbeatTimer;
+      let safetyTimer;
       try {
+        heartbeatTimer = setInterval(() => {
+          if (!finished) {
+            try { session.write(encodeAgentHeartbeat()); } catch {}
+          }
+        }, CURSOR_AGENT_HEARTBEAT_MS);
+        heartbeatTimer.unref?.();
+        safetyTimer = setTimeout(() => {
+          if (finished) return;
+          finished = true;
+          try { session.close(); } catch {}
+          onEvent({ type: "error", value: "Cursor AgentService stream timed out" });
+        }, CURSOR_AGENT_STREAM_TIMEOUT_MS);
+        safetyTimer.unref?.();
         while (!finished) {
           pending = decodeAgentFrames(pending, (payload) => {
             // A single read can carry several frames; once the turn is over the
@@ -869,6 +1058,18 @@ export class CursorExecutor extends BaseExecutor {
             traceLog(runId, `server_frame length=${payload.length} base64=${Buffer.from(payload).toString("base64")}`);
             const serverMessage = decodeMessage(payload);
             debugLog(`[CURSOR AGENT ${runId}] Server fields: ${describeAgentFields(serverMessage)}`);
+
+            // KV is a bidirectional side channel. Echo opaque metadata exactly;
+            // dropping it makes Cursor silently ignore otherwise valid replies.
+            const kvEvent = decodeAgentKvServerEvent(payload);
+            if (kvEvent) {
+              if (kvEvent.kind === "get") {
+                session.write(encodeAgentKvGetResult(kvEvent.id, new Uint8Array(), kvEvent.metadata));
+              } else {
+                session.write(encodeAgentKvSetResult(kvEvent.id, kvEvent.metadata));
+              }
+              return true;
+            }
 
             // agent.v1.AgentServerMessage.interaction_update
             if (serverMessage.has(1)) {
@@ -895,20 +1096,22 @@ export class CursorExecutor extends BaseExecutor {
             if (serverMessage.has(2)) {
               const execRequest = decodeMessage(serverMessage.get(2)[0].value);
               traceLog(runId, `exec_request fields=${describeAgentFields(execRequest)}`);
-              if (execRequest.has(10)) {
+              const execEvent = decodeExecServerEvent(payload);
+              if (execEvent?.kind === "exec_request_context") {
+                // Include declared MCP tools in the context envelope. Cursor
+                // versions that require context-local tool discovery otherwise
+                // accept the handshake but never expose the tools to the model.
                 session.write(createRequestContextResponse(execRequest, body.tools || []));
-              } else if (execRequest.has(17)) {
-                session.write(createListMcpResourcesResponse(execRequest));
-              } else if (execRequest.has(11)) {
-                const mcpArgs = decodeMcpArgs(execRequest.get(11)[0].value);
-                const correlationId = extractAgentString(execRequest, 15);
+              } else if (execEvent?.kind === "exec_list_mcp_resources") {
+                session.write(encodeAgentEmptyListMcpResources(execEvent.execMsgId, execEvent.execId));
+              } else if (execEvent?.kind === "exec_mcp") {
                 const toolCallId = normalizeAgentToolCallId(
-                  mcpArgs.toolCallId || correlationId || `call_${crypto.randomUUID()}`
+                  execEvent.toolCallId || execEvent.execId || `call_${crypto.randomUUID()}`
                 );
-                const toolName = mcpArgs.toolName || mcpArgs.name || "tool";
+                const toolName = execEvent.toolName || "tool";
                 retainedState = retainAgentToolCall(session, sessionOwner, toolCallId, execRequest);
                 keepSessionOpen = true;
-                traceLog(runId, `mcp_exec tool=${toolName} call_id=${toolCallId} args=${JSON.stringify(mcpArgs.args || {})}`);
+                traceLog(runId, `mcp_exec tool=${toolName} call_id=${toolCallId} args=${JSON.stringify(execEvent.args || {})}`);
                 finished = true;
                 onEvent({
                   type: "tool_call",
@@ -917,15 +1120,16 @@ export class CursorExecutor extends BaseExecutor {
                     type: "function",
                     function: {
                       name: toolName,
-                      arguments: JSON.stringify(mcpArgs.args || {}),
+                      arguments: JSON.stringify(execEvent.args || {}),
                     },
                   },
                 });
                 return false;
+              } else if (execEvent) {
+                // Typed rejection lets Cursor continue/fallback instead of
+                // wedging the bidirectional stream on an IDE-only operation.
+                handleNativeExec(execEvent, session);
               } else {
-                // Every other ExecServerMessage variant is an editor-backed tool
-                // (shell, read, write, …) that 9router cannot service. Fail the
-                // turn rather than narrating protocol state as assistant text.
                 debugLog(`[CURSOR AGENT ${runId}] Unsupported exec request fields: ${describeAgentFields(execRequest)}`);
                 finished = true;
                 onEvent({ type: "error", value: "Cursor AgentService requested an unsupported IDE tool" });
@@ -935,10 +1139,22 @@ export class CursorExecutor extends BaseExecutor {
 
             if (serverMessage.has(7)) {
               const query = Buffer.from(serverMessage.get(7)[0].value);
-              traceLog(
-                runId,
-                `interaction_query fields=${describeAgentFields(decodeMessage(query))} base64=${query.toString("base64")}`
-              );
+              const interaction = decodeAgentInteractionQuery(query);
+              if (interaction?.kind) {
+                // Auto-approve harmless searches/fetches so the agent loop
+                // never stalls waiting on an IDE dialog; reject questions,
+                // mode switches, and plan writes (no UI here to answer).
+                const approved = [2, 5, 6, 8, 9].includes(interaction.kind);
+                const reason = "Interaction unavailable in headless proxy mode";
+                const response = encodeAgentInteractionResponse(interaction.id, interaction.kind, approved, reason);
+                if (response) session.write(response);
+                traceLog(runId, `interaction_query kind=${interaction.kind} id=${interaction.id} approved=${approved}`);
+              } else {
+                traceLog(
+                  runId,
+                  `interaction_query fields=${describeAgentFields(decodeMessage(query))} base64=${query.toString("base64")}`
+                );
+              }
             }
             return true;
           });
@@ -951,6 +1167,8 @@ export class CursorExecutor extends BaseExecutor {
         if (retainedState) closeRetainedAgentSession(retainedState);
         throw error;
       } finally {
+        if (heartbeatTimer) clearInterval(heartbeatTimer);
+        if (safetyTimer) clearTimeout(safetyTimer);
         traceLog(runId, `consume_finally finished=${finished} pending=${pending.length}`);
         if (keepSessionOpen && retainedState) {
           retainedState.buffered = pending;

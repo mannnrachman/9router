@@ -1012,6 +1012,373 @@ export function extractTextFromResponse(payload) {
 
 // ==================== EXPORTS ====================
 
+// ==================== AgentService native tool bridge ====================
+// AgentService multiplexes IDE execution through ExecServerMessage. Keep this
+// codec separate from the legacy ChatService fields above.
+const AGENT_EXEC_SERVER_MESSAGE = 2;
+const AGENT_EXEC_ID = 15;
+const AGENT_EXEC_VARIANTS = {
+  shell: 2, write: 3, delete: 4, grep: 5, read: 7, ls: 8,
+  diagnostics: 9, requestContext: 10, mcp: 11, shellStream: 14,
+  backgroundShell: 16, listMcpResources: 17, readMcpResource: 18,
+  fetch: 20, recordScreen: 21, computerUse: 22, writeShellStdin: 23,
+  executeHook: 27,
+};
+
+function agentStringField(fields, field) {
+  const item = fields.get(field)?.[0];
+  return item?.value == null || typeof item.value === "number"
+    ? "" : textDecoder.decode(item.value);
+}
+
+function agentExecEnvelope(payload) {
+  const outer = decodeMessage(payload);
+  const item = outer.get(AGENT_EXEC_SERVER_MESSAGE)?.[0];
+  if (!item || item.wireType !== WIRE_TYPE.LEN) return null;
+  const fields = decodeMessage(item.value);
+  const id = fields.get(1)?.[0]?.value ?? 0;
+  const execId = agentStringField(fields, AGENT_EXEC_ID);
+  for (const [field, values] of fields) {
+    if (field === 1 || field === AGENT_EXEC_ID || field === 19) continue;
+    const value = values[0];
+    if (value?.wireType === WIRE_TYPE.LEN) return { id, execId, field, value: value.value };
+  }
+  return null;
+}
+
+export function decodeExecServerEvent(payload) {
+  const envelope = agentExecEnvelope(payload);
+  if (!envelope) return null;
+  const { id: execMsgId, execId, field, value } = envelope;
+  if (!value?.length && ![AGENT_EXEC_VARIANTS.requestContext, AGENT_EXEC_VARIANTS.mcp, AGENT_EXEC_VARIANTS.listMcpResources].includes(field)) return null;
+  const args = decodeMessage(value || new Uint8Array());
+  const text = (n) => agentStringField(args, n);
+  switch (field) {
+    case AGENT_EXEC_VARIANTS.requestContext: return { kind: "exec_request_context", execMsgId, execId };
+    case AGENT_EXEC_VARIANTS.read: return { kind: "exec_read", execMsgId, execId, path: text(1) };
+    case AGENT_EXEC_VARIANTS.write: return { kind: "exec_write", execMsgId, execId, path: text(1), fileText: text(2) };
+    case AGENT_EXEC_VARIANTS.delete: return { kind: "exec_delete", execMsgId, execId, path: text(1) };
+    case AGENT_EXEC_VARIANTS.ls: return { kind: "exec_ls", execMsgId, execId, path: text(1) };
+    case AGENT_EXEC_VARIANTS.grep: return { kind: "exec_grep", execMsgId, execId, pattern: text(1), path: text(2), glob: text(3) };
+    case AGENT_EXEC_VARIANTS.diagnostics: return { kind: "exec_diagnostics", execMsgId, execId, path: text(1) };
+    case AGENT_EXEC_VARIANTS.shell:
+      return { kind: "exec_shell", execMsgId, execId, command: text(1), workingDir: text(2) };
+    case AGENT_EXEC_VARIANTS.shellStream:
+      return { kind: "exec_shell_stream", execMsgId, execId, command: text(1), workingDir: text(2) };
+    case AGENT_EXEC_VARIANTS.backgroundShell:
+      return { kind: "exec_bg_shell", execMsgId, execId, command: text(1), workingDir: text(2) };
+    case AGENT_EXEC_VARIANTS.fetch: return { kind: "exec_fetch", execMsgId, execId, url: text(1) };
+    case AGENT_EXEC_VARIANTS.writeShellStdin:
+      return { kind: "exec_write_shell_stdin", execMsgId, execId, shellId: args.get(1)?.[0]?.value ?? 0, chars: text(2) };
+    case AGENT_EXEC_VARIANTS.listMcpResources: return { kind: "exec_list_mcp_resources", execMsgId, execId, server: text(1) };
+    case AGENT_EXEC_VARIANTS.readMcpResource: return { kind: "exec_read_mcp_resource", execMsgId, execId, server: text(1), uri: text(2), downloadPath: text(3) };
+    case AGENT_EXEC_VARIANTS.mcp: {
+      const toolName = text(5) || text(1);
+      const toolCallId = text(3);
+      const decodedArgs = {};
+      for (const entry of args.get(2) || []) {
+        const map = decodeMessage(entry.value);
+        const key = agentStringField(map, 1);
+        const encoded = map.get(2)?.[0]?.value;
+        if (key && encoded) decodedArgs[key] = decodeAgentValue(encoded);
+      }
+      return { kind: "exec_mcp", execMsgId, execId, toolName, toolCallId, args: decodedArgs };
+    }
+    case AGENT_EXEC_VARIANTS.recordScreen: return { kind: "exec_record_screen", execMsgId, execId, mode: args.get(1)?.[0]?.value ?? 0, saveAsFilename: text(3) };
+    case AGENT_EXEC_VARIANTS.computerUse: return { kind: "exec_computer_use", execMsgId, execId, rawArgs: value };
+    case AGENT_EXEC_VARIANTS.executeHook: {
+      const request = args.get(1)?.[0]?.value;
+      const requestFields = request ? decodeMessage(request) : new Map();
+      const hookType = requestFields.has(1)
+        ? "pre_compact"
+        : requestFields.has(2)
+          ? "subagent_start"
+          : requestFields.has(3)
+            ? "subagent_stop"
+            : "pre_compact";
+      return { kind: "exec_execute_hook", execMsgId, execId, hookType, rawArgs: value };
+    }
+    default: return { kind: "exec_unknown", execMsgId, execId, field };
+  }
+}
+
+function wrapAgentExecResult(id, execId, resultField, resultVariant, variantField = null) {
+  const result = variantField == null ? resultVariant : encodeField(variantField, WIRE_TYPE.LEN, resultVariant);
+  const exec = concatArrays(
+    encodeField(1, WIRE_TYPE.VARINT, id || 0),
+    ...(execId ? [encodeField(AGENT_EXEC_ID, WIRE_TYPE.LEN, execId)] : []),
+    encodeField(resultField, WIRE_TYPE.LEN, result)
+  );
+  return wrapConnectRPCFrame(encodeField(2, WIRE_TYPE.LEN, exec));
+}
+function rejected(path, reason) { return concatArrays(encodeField(1, WIRE_TYPE.LEN, path || ""), encodeField(2, WIRE_TYPE.LEN, reason)); }
+function shellRejected(command, cwd, reason) { return concatArrays(encodeField(1, WIRE_TYPE.LEN, command || ""), encodeField(2, WIRE_TYPE.LEN, cwd || ""), encodeField(3, WIRE_TYPE.LEN, reason)); }
+function errorMessage(reason) { return encodeField(1, WIRE_TYPE.LEN, reason); }
+const BUILTIN_REJECT = "Tool not available in this environment. Use the MCP tools provided instead.";
+
+export function encodeAgentNativeRejection(event, reason = BUILTIN_REJECT) {
+  if (!event || event.kind === "exec_request_context" || event.kind === "exec_mcp") return null;
+  const map = {
+    exec_read: [7, rejected(event.path, reason), 3],
+    exec_write: [3, rejected(event.path, reason), 6],
+    exec_delete: [4, rejected(event.path, reason), 6],
+    exec_ls: [8, rejected(event.path, reason), 3],
+    exec_shell: [2, shellRejected(event.command, event.workingDir, reason), 4],
+    exec_shell_stream: [14, shellRejected(event.command, event.workingDir, reason), 5],
+    exec_bg_shell: [16, shellRejected(event.command, event.workingDir, reason), 3],
+    exec_grep: [5, errorMessage(reason), 2],    exec_fetch: [20, concatArrays(encodeField(1, WIRE_TYPE.LEN, event.url || ""), encodeField(2, WIRE_TYPE.LEN, reason)), 2],
+    exec_write_shell_stdin: [23, errorMessage(reason), 2],
+    exec_diagnostics: [9, rejected(event.path, reason), 3],
+    exec_list_mcp_resources: [17, errorMessage(reason), 3],
+    exec_read_mcp_resource: [18, concatArrays(encodeField(1, WIRE_TYPE.LEN, event.uri || ""), encodeField(2, WIRE_TYPE.LEN, reason)), 3],
+    exec_record_screen: [21, errorMessage(reason), 4],
+    exec_computer_use: [22, errorMessage(reason), 2],
+  };
+  if (event.kind === "exec_execute_hook") {
+    const responseField = event.hookType === "subagent_start" ? 2 : event.hookType === "subagent_stop" ? 3 : 1;
+    const response = encodeField(1, WIRE_TYPE.LEN, encodeField(responseField, WIRE_TYPE.LEN, new Uint8Array()));
+    return wrapAgentExecResult(event.execMsgId, event.execId, 27, response);
+  }
+  const [resultField, payload, variantField] = map[event.kind] || [null, null, null];
+  return resultField ? wrapAgentExecResult(event.execMsgId, event.execId, resultField, payload, variantField) : null;
+}
+
+export function encodeAgentRequestContextResponse(execMsgId, execId) {
+  const success = encodeField(1, WIRE_TYPE.LEN, encodeField(1, WIRE_TYPE.LEN, new Uint8Array()));
+  const exec = concatArrays(encodeField(1, WIRE_TYPE.VARINT, execMsgId || 0), ...(execId ? [encodeField(AGENT_EXEC_ID, WIRE_TYPE.LEN, execId)] : []), encodeField(10, WIRE_TYPE.LEN, success));
+  return wrapConnectRPCFrame(encodeField(2, WIRE_TYPE.LEN, exec));
+}
+
+export function encodeAgentEmptyListMcpResources(execMsgId, execId) {
+  const success = encodeField(1, WIRE_TYPE.LEN, new Uint8Array());
+  const exec = concatArrays(encodeField(1, WIRE_TYPE.VARINT, execMsgId || 0), ...(execId ? [encodeField(AGENT_EXEC_ID, WIRE_TYPE.LEN, execId)] : []), encodeField(17, WIRE_TYPE.LEN, success));
+  return wrapConnectRPCFrame(encodeField(2, WIRE_TYPE.LEN, exec));
+}
+
+export function encodeAgentMcpResult(execMsgId, execId, content, isError = false) {
+  const text = encodeField(1, WIRE_TYPE.LEN, encodeField(1, WIRE_TYPE.LEN, String(content ?? "")));
+  const success = concatArrays(encodeField(1, WIRE_TYPE.LEN, text), ...(isError ? [encodeField(2, WIRE_TYPE.VARINT, 1)] : []));
+  return wrapAgentExecResult(execMsgId, execId, 11, success, 1);
+}
+
+export function decodeAgentKvServerEvent(payload) {
+  const outer = decodeMessage(payload);
+  const item = outer.get(4)?.[0];
+  if (!item || item.wireType !== WIRE_TYPE.LEN) return null;
+  const fields = decodeMessage(item.value);
+  const id = fields.get(1)?.[0]?.value ?? 0;
+  const metadata = fields.get(4)?.[0]?.value || null;
+  const getArgs = fields.get(2)?.[0]?.value;
+  const setArgs = fields.get(3)?.[0]?.value;
+  const readBytes = (data, field) => decodeMessage(data).get(field)?.[0]?.value || new Uint8Array();
+  if (getArgs) return { kind: "get", id, blobId: readBytes(getArgs, 1), metadata };
+  if (setArgs) return { kind: "set", id, blobId: readBytes(setArgs, 1), blobData: readBytes(setArgs, 2), metadata };
+  return null;
+}
+
+function encodeAgentKvClientMessage(id, variantField, variant, metadata) {
+  return wrapConnectRPCFrame(encodeField(3, WIRE_TYPE.LEN, concatArrays(
+    ...(id ? [encodeField(1, WIRE_TYPE.VARINT, id)] : []),
+    encodeField(variantField, WIRE_TYPE.LEN, variant),
+    ...(metadata?.length ? [encodeField(4, WIRE_TYPE.LEN, metadata)] : []),
+  )));
+}
+
+export function encodeAgentKvGetResult(id, blob, metadata) {
+  return encodeAgentKvClientMessage(id, 2, encodeField(1, WIRE_TYPE.LEN, blob || new Uint8Array()), metadata);
+}
+export function encodeAgentKvSetResult(id, metadata) {
+  return encodeAgentKvClientMessage(id, 3, new Uint8Array(), metadata);
+}
+
+// ─── Native tool SUCCESS encoders (official agent/v1/*_exec.proto) ───────
+
+export function encodeAgentReadSuccess(execMsgId, execId, { path = "", content = "", truncated = false, fileSize = 0 } = {}) {
+  const lines = content ? content.split("\n").length : 0;
+  const success = concatArrays(
+    encodeField(1, WIRE_TYPE.LEN, path),
+    encodeField(2, WIRE_TYPE.LEN, content),
+    encodeField(3, WIRE_TYPE.VARINT, lines),
+    encodeField(4, WIRE_TYPE.VARINT, fileSize),
+    ...(truncated ? [encodeField(6, WIRE_TYPE.VARINT, 1)] : [])
+  );
+  return wrapAgentExecResult(execMsgId, execId, 7, success, 1);
+}
+
+export function encodeAgentGrepSuccess(execMsgId, execId, { pattern = "", path = ".", matches = [], truncated = false } = {}) {
+  // GrepFileMatch -> repeated inside GrepContentResult.matches (field 1)
+  const fileMatches = matches.map(({ file = "", lines = [] }) =>
+    encodeField(1, WIRE_TYPE.LEN, concatArrays(
+      encodeField(1, WIRE_TYPE.LEN, file),
+      ...lines.map(({ lineNumber = 0, content = "" }) =>
+        encodeField(2, WIRE_TYPE.LEN, concatArrays(encodeField(1, WIRE_TYPE.VARINT, lineNumber), encodeField(2, WIRE_TYPE.LEN, content)))
+      )
+    ))
+  );
+  const totalMatched = matches.reduce((n, m) => n + (m.lines?.length || 0), 0);
+  // GrepContentResult
+  const contentResult = concatArrays(
+    ...fileMatches,
+    encodeField(2, WIRE_TYPE.VARINT, totalMatched),
+    encodeField(3, WIRE_TYPE.VARINT, totalMatched),
+    ...(truncated ? [encodeField(4, WIRE_TYPE.VARINT, 1)] : [])
+  );
+  // GrepUnionResult.content = 3 ; map entry key=1 value=2 ; workspace_results=4
+  const entry = concatArrays(encodeField(1, WIRE_TYPE.LEN, path || "."), encodeField(2, WIRE_TYPE.LEN, encodeField(3, WIRE_TYPE.LEN, contentResult)));
+  const success = concatArrays(
+    encodeField(1, WIRE_TYPE.LEN, pattern),
+    encodeField(2, WIRE_TYPE.LEN, path || "."),
+    encodeField(3, WIRE_TYPE.LEN, "content"),
+    encodeField(4, WIRE_TYPE.LEN, entry)
+  );
+  return wrapAgentExecResult(execMsgId, execId, 5, success, 1);
+}
+
+export function encodeAgentLsSuccess(execMsgId, execId, { path = "", files = [], dirs = [], truncated = false, numFiles = 0 } = {}) {
+  // LsDirectoryTreeNode: abs_path=1, children_dirs=2, children_files=3,
+  // children_were_processed=4, full_subtree_extension_counts=5, num_files=6
+  const node = concatArrays(
+    encodeField(1, WIRE_TYPE.LEN, path),
+    ...dirs.map((d) => encodeField(2, WIRE_TYPE.LEN, encodeField(1, WIRE_TYPE.LEN, d))),
+    ...files.map((f) => encodeField(3, WIRE_TYPE.LEN, encodeField(1, WIRE_TYPE.LEN, f))),
+    encodeField(4, WIRE_TYPE.VARINT, 1),
+    ...(truncated ? [encodeField(5, WIRE_TYPE.VARINT, 0)] : []),
+    encodeField(6, WIRE_TYPE.VARINT, numFiles)
+  );
+  const success = encodeField(1, WIRE_TYPE.LEN, node);
+  return wrapAgentExecResult(execMsgId, execId, 8, success, 1);
+}
+
+export function encodeAgentDiagnosticsSuccess(execMsgId, execId, path = "") {
+  const success = concatArrays(encodeField(1, WIRE_TYPE.LEN, path), encodeField(3, WIRE_TYPE.VARINT, 0));
+  return wrapAgentExecResult(execMsgId, execId, 9, success, 1);
+}
+
+export function encodeAgentFetchSuccess(execMsgId, execId, { url = "", content = "", statusCode = 200, contentType = "" } = {}) {
+  const success = concatArrays(
+    encodeField(1, WIRE_TYPE.LEN, url),
+    encodeField(2, WIRE_TYPE.LEN, content),
+    encodeField(3, WIRE_TYPE.VARINT, statusCode),
+    ...(contentType ? [encodeField(4, WIRE_TYPE.LEN, contentType)] : [])
+  );
+  return wrapAgentExecResult(execMsgId, execId, 20, success, 1);
+}
+
+export function encodeAgentWriteSuccess(execMsgId, execId, { path = "", linesCreated = 0, fileSize = 0, contentAfter = null } = {}) {
+  const success = concatArrays(
+    encodeField(1, WIRE_TYPE.LEN, path),
+    encodeField(2, WIRE_TYPE.VARINT, linesCreated),
+    encodeField(3, WIRE_TYPE.VARINT, fileSize),
+    ...(contentAfter != null ? [encodeField(4, WIRE_TYPE.LEN, contentAfter)] : [])
+  );
+  return wrapAgentExecResult(execMsgId, execId, 3, success, 1);
+}
+
+export function encodeAgentDeleteSuccess(execMsgId, execId, { path = "", deletedFile = "", fileSize = 0, prevContent = "" } = {}) {
+  const success = concatArrays(
+    encodeField(1, WIRE_TYPE.LEN, path),
+    encodeField(2, WIRE_TYPE.LEN, deletedFile),
+    encodeField(3, WIRE_TYPE.VARINT, fileSize),
+    encodeField(4, WIRE_TYPE.LEN, prevContent)
+  );
+  return wrapAgentExecResult(execMsgId, execId, 4, success, 1);
+}
+
+export function encodeAgentShellSuccess(execMsgId, execId, { command = "", cwd = "", exitCode = 0, stdout = "", stderr = "", executionTime = 0 } = {}) {
+  const success = concatArrays(
+    encodeField(1, WIRE_TYPE.LEN, command),
+    encodeField(2, WIRE_TYPE.LEN, cwd),
+    encodeField(3, WIRE_TYPE.VARINT, exitCode),
+    ...(stdout ? [encodeField(5, WIRE_TYPE.LEN, stdout)] : []),
+    ...(stderr ? [encodeField(6, WIRE_TYPE.LEN, stderr)] : []),
+    encodeField(7, WIRE_TYPE.VARINT, executionTime)
+  );
+  return wrapAgentExecResult(execMsgId, execId, 2, success, 1);
+}
+
+export function encodeAgentShellFailure(execMsgId, execId, { command = "", cwd = "", exitCode = 1, stdout = "", stderr = "", executionTime = 0, error = "" } = {}) {
+  const failure = concatArrays(
+    encodeField(1, WIRE_TYPE.LEN, command),
+    encodeField(2, WIRE_TYPE.LEN, cwd),
+    encodeField(3, WIRE_TYPE.VARINT, exitCode),
+    ...(stdout ? [encodeField(5, WIRE_TYPE.LEN, stdout)] : []),
+    ...(stderr ? [encodeField(6, WIRE_TYPE.LEN, stderr)] : []),
+    encodeField(7, WIRE_TYPE.VARINT, executionTime),
+    ...(error ? [encodeField(9, WIRE_TYPE.LEN, error)] : [])
+  );
+  return wrapAgentExecResult(execMsgId, execId, 2, failure, 2);
+}
+
+export function encodeAgentShellTimeout(execMsgId, execId, { command = "", cwd = "", timeoutMs = 30000 } = {}) {
+  const timeout = concatArrays(
+    encodeField(1, WIRE_TYPE.LEN, command),
+    encodeField(2, WIRE_TYPE.LEN, cwd),
+    encodeField(3, WIRE_TYPE.VARINT, timeoutMs)
+  );
+  return wrapAgentExecResult(execMsgId, execId, 2, timeout, 3);
+}
+
+// ─── Interaction query (permission) auto-response ─────────────────────────
+// AgentServerMessage.interaction_query=7 -> AgentClientMessage.interaction_response=6.
+// InteractionResponse { id=1, oneof result: web_search=2, ask_question=3,
+// switch_mode=4, exa_search=5, exa_fetch=6, create_plan=7, setup_vm=8, web_fetch=9 }
+
+export function decodeAgentInteractionQuery(payload) {
+  const outer = decodeMessage(payload);
+  const item = outer.get(7)?.[0];
+  if (!item || item.wireType !== WIRE_TYPE.LEN) return null;
+  const fields = decodeMessage(item.value);
+  const id = fields.get(1)?.[0]?.value ?? 0;
+  const kind = [2, 3, 4, 5, 6, 7, 8, 9].find((f) => fields.has(f)) || 0;
+  return { id, kind };
+}
+
+export function encodeAgentInteractionResponse(id, queryKind, approved = true, reason = "") {
+  // Body per kind (official interaction tool protos). Field number in
+  // InteractionResponse mirrors the query kind.
+  let body;
+  switch (queryKind) {
+    case 2: // web_search
+    case 5: // exa_search
+    case 6: // exa_fetch
+    case 9: // web_fetch
+      body = approved
+        ? encodeField(1, WIRE_TYPE.LEN, new Uint8Array())
+        : encodeField(2, WIRE_TYPE.LEN, encodeField(1, WIRE_TYPE.LEN, reason));
+      break;
+    case 4: // switch_mode
+      body = approved
+        ? encodeField(1, WIRE_TYPE.LEN, new Uint8Array())
+        : encodeField(2, WIRE_TYPE.LEN, encodeField(1, WIRE_TYPE.LEN, reason));
+      break;
+    case 3: // ask_question -> AskQuestionResult.rejected = 3
+      body = encodeField(3, WIRE_TYPE.LEN, encodeField(1, WIRE_TYPE.LEN, reason));
+      break;
+    case 7: // create_plan -> CreatePlanResult.error = 2
+      body = encodeField(2, WIRE_TYPE.LEN, encodeField(1, WIRE_TYPE.LEN, reason));
+      break;
+    case 8: // setup_vm -> SetupVmEnvironmentResult.success = 1 (only option)
+      body = encodeField(1, WIRE_TYPE.LEN, new Uint8Array());
+      break;
+    default:
+      return null;
+  }
+  const response = concatArrays(
+    encodeField(1, WIRE_TYPE.VARINT, id || 0),
+    encodeField(queryKind, WIRE_TYPE.LEN, body)
+  );
+  return wrapConnectRPCFrame(encodeField(6, WIRE_TYPE.LEN, response));
+}
+
+export function encodeAgentHeartbeat() {
+  return wrapConnectRPCFrame(encodeField(7, WIRE_TYPE.LEN, new Uint8Array()));
+}
+
+export function encodeAgentStreamClose(id = 0) {
+  const streamClose = encodeField(1, WIRE_TYPE.LEN, encodeField(1, WIRE_TYPE.VARINT, id));
+  return wrapConnectRPCFrame(encodeField(5, WIRE_TYPE.LEN, streamClose));
+}
+
 export default {
   encodeVarint,
   encodeField,
