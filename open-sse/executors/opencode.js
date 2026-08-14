@@ -25,7 +25,8 @@ export class OpenCodeExecutor extends BaseExecutor {
     return {
       "Content-Type": "application/json",
       "Authorization": "Bearer public",
-      "x-opencode-client": "desktop",
+      "User-Agent": "opencode/latest/1.14.50/cli",
+      "x-opencode-client": "cli",
       "Accept": "text/event-stream"
     };
   }
