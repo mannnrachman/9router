@@ -10,10 +10,14 @@ import {
   encodeMcpResultSuccess,
   encodeMcpResultError,
   encodeMcpResultToolNotFound,
+  encodeRequest,
 } from "../../open-sse/utils/cursorProtobuf.js";
 import {
   isAgentCapableRequest,
   buildAgentRunFrame,
+  capCursorToolResult,
+  compactCursorMessages,
+  estimateCursorContextTokens,
 } from "../../open-sse/executors/cursor.js";
 import {
   decodeExecServerEvent,
@@ -381,6 +385,33 @@ describe("Cursor AgentService executor helpers (cursor.js)", () => {
     });
   });
 
+  describe("context controls", () => {
+    it.each([
+      ["medium", 1], ["low", 1], ["high", 2], ["xhigh", 2], ["max", 2],
+    ])("maps %s reasoning to Cursor thinking level", (effort, expected) => {
+      const request = decodeMessage(encodeRequest([{ role: "user", content: "hi" }], "gpt-5.2", [], effort));
+      expect(request.get(49)[0].value).toBe(expected);
+    });
+    it("maps large context to a compacted suffix without dropping current tool state", () => {
+      const messages = [
+        { role: "user", content: "old".repeat(30) },
+        { role: "assistant", content: "old answer".repeat(30) },
+        { role: "user", content: "current" },
+      ];
+      const compacted = compactCursorMessages(messages, "gpt-5.2", [], 100);
+      expect(compacted.at(-1).content).toBe("current");
+      expect(compacted.some((message) => message.content?.includes("Earlier context compacted"))).toBe(true);
+      expect(estimateCursorContextTokens(compacted)).toBeLessThan(100);
+    });
+
+    it("caps MCP result text by UTF-8 bytes while preserving a truncation marker", () => {
+      const capped = capCursorToolResult("😀".repeat(100), 80);
+      expect(Buffer.byteLength(capped)).toBeLessThanOrEqual(80);
+      expect(capped).toContain("truncated");
+      expect(capCursorToolResult("ok", 4)).toBe("ok");
+    });
+  });
+
   describe("buildAgentRunFrame", () => {
     // buildAgentRunFrame returns a wrapped Connect-RPC frame (5-byte header + AgentClientMessage).
     const unwrap = (frame) => frame.subarray(5);
@@ -444,6 +475,16 @@ describe("Cursor AgentService executor helpers (cursor.js)", () => {
       const frame = unwrap(buildAgentRunFrame([{ role: "user", content: "hi" }], "gpt-5.2", []));
       const run = decodeMessage(decodeMessage(frame).get(1)[0].value);
       expect(run.has(4)).toBe(false);
+    });
+
+    it("passes reasoning effort to the live AgentService model variant", () => {
+      const frame = unwrap(buildAgentRunFrame([{ role: "user", content: "hi" }], "gpt-5.2", [], null, "max"));
+      const run = decodeMessage(decodeMessage(frame).get(1)[0].value);
+      const requested = decodeMessage(run.get(9)[0].value);
+      const parameter = decodeMessage(requested.get(3)[0].value);
+      expect(requested.get(3)).toHaveLength(1);
+      expect(Buffer.from(parameter.get(1)[0].value).toString()).toBe("reasoning");
+      expect(Buffer.from(parameter.get(2)[0].value).toString()).toBe("max");
     });
 
     it("encodes conversation_history from prior turns including tool calls/results", () => {

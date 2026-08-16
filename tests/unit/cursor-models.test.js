@@ -27,6 +27,10 @@ function field(fieldNumber, value) {
   return concat(varint((fieldNumber << 3) | 2), varint(value.length), value);
 }
 
+function varintField(fieldNumber, value) {
+  return concat(varint((fieldNumber << 3) | 0), varint(value));
+}
+
 function text(value) {
   return new TextEncoder().encode(value);
 }
@@ -161,6 +165,70 @@ describe("Cursor live model catalog", () => {
     });
   });
 
+  it("resolves auto/default to the account's default agent-capable model", () => {
+    const payload = concat(
+      availableModel({
+        id: "chat-only-model",
+        name: "Chat Only",
+        legacySlugs: [],
+      }),
+      // field 4 = is_chat_only, field 5 = supports_agent, field 35 = is_hidden
+      field(2, concat(
+        field(1, text("claude-4.6-sonnet")),
+        field(17, text("Claude 4.6 Sonnet")),
+        varintField(5, 1),
+      )),
+      field(2, concat(
+        field(1, text("grok-4.5")),
+        field(17, text("Grok 4.5")),
+        varintField(2, 1), // default_on
+        varintField(5, 1), // supports_agent
+      )),
+    );
+
+    const models = parseCursorAvailableModels(payload);
+    expect(resolveCursorModelSelection(models, "auto")).toMatchObject({
+      modelId: "grok-4.5",
+      matchedBy: "auto-default",
+    });
+    expect(resolveCursorModelSelection(models, "default")).toMatchObject({
+      modelId: "grok-4.5",
+      matchedBy: "auto-default",
+    });
+  });
+
+  it("auto falls back to the first usable agent model when none is default", () => {
+    const payload = concat(
+      field(2, concat(
+        field(1, text("claude-4.6-sonnet")),
+        field(17, text("Claude 4.6 Sonnet")),
+        varintField(4, 1), // is_chat_only
+      )),
+      field(2, concat(
+        field(1, text("grok-4.5")),
+        field(17, text("Grok 4.5")),
+        varintField(5, 1), // supports_agent
+      )),
+    );
+
+    const models = parseCursorAvailableModels(payload);
+    expect(resolveCursorModelSelection(models, "auto")).toMatchObject({
+      modelId: "grok-4.5",
+      matchedBy: "auto-default",
+    });
+  });
+
+  it("auto returns null when no agent-capable model exists", () => {
+    const payload = concat(
+      field(2, concat(
+        field(1, text("claude-4.6-sonnet")),
+        field(17, text("Claude 4.6 Sonnet")),
+        varintField(4, 1), // is_chat_only
+      )),
+    );
+    expect(resolveCursorModelSelection(parseCursorAvailableModels(payload), "auto")).toBeNull();
+  });
+
   it("fetches the account-specific catalog and caches it", async () => {
     const payload = availableModel({ id: "claude-4.6-opus", name: "Claude 4.6 Opus" });
     mockUnaryResponse(payload);
@@ -174,6 +242,10 @@ describe("Cursor live model catalog", () => {
         id: "claude-4.6-opus",
         name: "Claude 4.6 Opus",
         serverModelName: "",
+        defaultOn: false,
+        isChatOnly: false,
+        supportsAgent: false,
+        isHidden: false,
         legacySlugs: [],
         idAliases: [],
         variants: [],
@@ -184,6 +256,10 @@ describe("Cursor live model catalog", () => {
         id: "claude-4.6-opus",
         name: "Claude 4.6 Opus",
         serverModelName: "",
+        defaultOn: false,
+        isChatOnly: false,
+        supportsAgent: false,
+        isHidden: false,
         legacySlugs: [],
         idAliases: [],
         variants: [],

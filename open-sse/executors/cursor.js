@@ -6,11 +6,9 @@ import {
   encodeField,
   wrapConnectRPCFrame,
   decodeMessage,
-  parseConnectRPCFrame,
   extractTextFromResponse,
   encodeMcpToolDefinition,
   encodeMcpTools,
-  decodeMcpArgs,
   encodeMcpResultSuccess,
   decodeExecServerEvent,
   encodeAgentNativeRejection,
@@ -39,7 +37,7 @@ import { chatChunkSse, sseChunk } from "../utils/sse.js";
 import { FORMATS } from "../translator/formats.js";
 import { proxyAwareFetch } from "../utils/proxyFetch.js";
 import { resolveCursorModel, resolveCursorModelSelection } from "../services/cursorModels.js";
-import zlib from "zlib";
+import zlib from "node:zlib";
 import { promises as fs } from "node:fs";
 import { spawn } from "node:child_process";
 import path from "node:path";
@@ -53,6 +51,88 @@ const NATIVE_READ_CAP = Number(process.env.CURSOR_READ_CAP) || 1024 * 1024;
 const NATIVE_SHELL_TIMEOUT_MS = Number(process.env.CURSOR_SHELL_TIMEOUT_MS) || 30000;
 const NATIVE_GREP_MAX = 500;
 const NATIVE_LS_MAX = 500;
+const CURSOR_MCP_RESULT_CAP = (() => {
+  const value = Number(process.env.CURSOR_MCP_RESULT_CAP);
+  return Number.isFinite(value) && value > 0 ? Math.floor(value) : 64 * 1024;
+})();
+const CURSOR_CONTEXT_COMPACT_TRIGGER = 0.8;
+const CURSOR_CONTEXT_COMPACT_TARGET = 0.6;
+const CURSOR_DEFAULT_CONTEXT_WINDOW = 200_000;
+
+function getCursorContextWindow() {
+  const configured = Number(process.env.CURSOR_CONTEXT_WINDOW);
+  return Number.isFinite(configured) && configured > 0
+    ? Math.floor(configured)
+    : CURSOR_DEFAULT_CONTEXT_WINDOW;
+}
+
+export function estimateCursorContextTokens(messages, tools = []) {
+  try {
+    const body = { messages: Array.isArray(messages) ? messages : [] };
+    if (Array.isArray(tools) && tools.length > 0) body.tools = tools;
+    return Math.ceil(Buffer.byteLength(JSON.stringify(body), "utf8") / 4);
+  } catch {
+    return 0;
+  }
+}
+
+export function capCursorToolResult(content, cap = CURSOR_MCP_RESULT_CAP) {
+  const text = typeof content === "string" ? content : String(content ?? "");
+  const limit = Number.isFinite(cap) && cap > 0 ? Math.floor(cap) : CURSOR_MCP_RESULT_CAP;
+  const bytes = Buffer.byteLength(text, "utf8");
+  if (bytes <= limit) return text;
+  const marker = "\n[9router: MCP result truncated; use a narrower query or pagination]";
+  if (limit <= marker.length) return marker.slice(0, limit);
+  const available = limit - Buffer.byteLength(marker, "utf8");
+  const prefix = Buffer.from(text, "utf8").subarray(0, available).toString("utf8");
+  return `${prefix}${marker}`;
+}
+
+function capCursorToolXml(content) {
+  const text = typeof content === "string" ? content : String(content ?? "");
+  if (!text.includes("<tool_result>")) return text;
+  return text.replace(/(<result>)([\s\S]*?)(<\/result>)/g, (_match, open, result, close) => (
+    `${open}${capCursorToolResult(result)}${close}`
+  ));
+}
+
+export function compactCursorMessages(messages, _model, tools = [], contextWindow = getCursorContextWindow()) {
+  if (!Array.isArray(messages) || messages.length < 3) return messages || [];
+  const contextTokens = estimateCursorContextTokens(messages, tools);
+  const trigger = Math.floor(contextWindow * CURSOR_CONTEXT_COMPACT_TRIGGER);
+  if (!contextTokens || contextTokens <= trigger) return messages;
+
+  const systemMessages = messages.filter((message) => message?.role === "system");
+  const chatMessages = messages.filter((message) => message?.role !== "system");
+  const currentIndex = [...chatMessages]
+    .map((message) => message?.role)
+    .findLastIndex((role) => role === "user" || role === "tool");
+  let suffixStart = currentIndex >= 0 ? currentIndex : chatMessages.length - 1;
+  if (chatMessages[suffixStart]?.role === "tool" && chatMessages[suffixStart - 1]?.role === "assistant") suffixStart--;
+  const suffix = chatMessages.slice(suffixStart);
+  const history = chatMessages.slice(0, suffixStart);
+  if (!suffix.length || !history.length) return messages;
+
+  const target = Math.floor(contextWindow * CURSOR_CONTEXT_COMPACT_TARGET);
+  const kept = [];
+  let keptTokens = estimateCursorContextTokens([...systemMessages, ...suffix], tools);
+  for (let i = history.length - 1; i >= 0; i--) {
+    const messageTokens = estimateCursorContextTokens([history[i]]);
+    if (keptTokens + messageTokens > target) break;
+    kept.unshift(history[i]);
+    keptTokens += messageTokens;
+  }
+
+  const dropped = history.length - kept.length;
+  if (dropped <= 0) return messages;
+
+  // ponytail: deterministic suffix drop; may lose old details, but agent can reread files. No nested LLM call.
+  const note = {
+    role: "system",
+    content: `[9router] Earlier context compacted: ${dropped} messages omitted. Re-read files and current tool state before continuing.`,
+  };
+  return [...systemMessages, note, ...kept, ...suffix];
+}
 
 function inWorkspace(p) {
   const resolved = path.resolve(p || "");
@@ -193,7 +273,7 @@ function handleNativeExec(execEvent, session) {
   execNativeTool(execEvent, session);
   return true;
 }
-import crypto from "crypto";
+import crypto from "node:crypto";
 
 // Detect cloud environment
 const isCloudEnv = () => {
@@ -206,7 +286,7 @@ const isCloudEnv = () => {
 let http2 = null;
 if (!isCloudEnv()) {
   try {
-    http2 = await import("http2");
+    http2 = await import("node:http2");
   } catch {
     // http2 not available
   }
@@ -226,8 +306,115 @@ const PROTOBUF_VARINT = 0;
 const CURSOR_AGENT_SESSION_TTL_MS = 5 * 60 * 1000;
 const CURSOR_AGENT_STREAM_TIMEOUT_MS = Number(process.env.CURSOR_STREAM_TIMEOUT_MS || 300000);
 const CURSOR_AGENT_HEARTBEAT_MS = Number(process.env.CURSOR_HEARTBEAT_MS || 5000);
+const CURSOR_AGENT_MAX_RETRIES = (() => {
+  const value = Number(process.env.CURSOR_AGENT_MAX_RETRIES);
+  return Number.isFinite(value) && value >= 0 ? Math.floor(value) : 2;
+})();
+// Conversation persistence: blobs + checkpoints survive past the 5-min tool-call
+// session TTL, so a later turn can resume the same Cursor conversation (pi-cursor parity).
+const CURSOR_CONVERSATION_TTL_MS = 30 * 60 * 1000;
+const MAX_BLOBS_PER_OWNER = 128;
 const retainedAgentSessions = new Map();
 const retainedAgentToolCalls = new Map();
+const agentConversations = new Map(); // owner -> { conversationId, checkpoint, blobStore, turnCount, fingerprint }
+
+function getAgentConversation(owner) {
+  let conv = agentConversations.get(owner);
+  if (!conv) {
+    conv = {
+      conversationId: crypto.randomUUID(),
+      checkpoint: null,
+      blobStore: new Map(),
+      turnCount: 0,
+      fingerprint: null,
+      tokenUsage: null,
+      outputTokens: 0,
+      lastAccessMs: Date.now(),
+      timer: null,
+    };
+    agentConversations.set(owner, conv);
+  }
+  conv.lastAccessMs = Date.now();
+  clearTimeout(conv.timer);
+  conv.timer = setTimeout(() => {
+    if (agentConversations.get(owner) === conv) agentConversations.delete(owner);
+  }, CURSOR_CONVERSATION_TTL_MS);
+  conv.timer.unref?.();
+  return conv;
+}
+
+// Discard checkpoint, blobs, and lineage; assign a new conversation ID.
+// Used on lineage mismatch (edit/fork/compaction) and blob_not_found retry.
+function resetAgentConversation(conv) {
+  conv.conversationId = crypto.randomUUID();
+  conv.checkpoint = null;
+  conv.blobStore.clear();
+  conv.turnCount = 0;
+  conv.fingerprint = null;
+  conv.tokenUsage = null;
+  conv.outputTokens = 0;
+}
+
+// SHA256 over user-text turns in order; mismatch means the client history no
+// longer matches the checkpoint (edited/forked conversation) -> start fresh.
+function computeLineageFingerprint(userTexts) {
+  const hash = crypto.createHash("sha256");
+  for (const text of userTexts) {
+    hash.update(text);
+    hash.update("\0");
+  }
+  return hash.digest("hex");
+}
+
+function extractUserTexts(body) {
+  return (body?.messages || [])
+    .filter((message) => message?.role === "user")
+    .map((message) => textFromContent(message?.content));
+}
+
+function validateConversationLineage(conv, userTexts) {
+  if (conv.checkpoint === null) return true; // nothing stored yet -> fresh
+  const turns = userTexts.slice(0, -1);
+  if (conv.turnCount !== turns.length) return false;
+  if (conv.fingerprint === null) return true;
+  return conv.fingerprint === computeLineageFingerprint(turns);
+}
+
+function commitConversationTurn(conv, userTexts) {
+  conv.turnCount = userTexts.length;
+  conv.fingerprint = computeLineageFingerprint(userTexts);
+}
+
+function pruneAgentBlobs(blobStore) {
+  const excess = blobStore.size - MAX_BLOBS_PER_OWNER;
+  if (excess <= 0) return;
+  for (const key of blobStore.keys()) {
+    if (excess <= 0) break;
+    blobStore.delete(key);
+    excess--;
+  }
+}
+
+function retryDelayMs(hint) {
+  let base;
+  switch (hint) {
+    case "blob_not_found": base = 200; break;
+    case "resource_exhausted": base = 2000; break;
+    default: base = 1000; break;
+  }
+  return Math.round(base * (1 + Math.random() * 0.5));
+}
+
+function classifyCursorError(message) {
+  const text = String(message || "");
+  if (/blob not found/i.test(text)) return "blob_not_found";
+  if (/resource_exhausted/i.test(text)) return "resource_exhausted";
+  return null;
+}
+
+function sleepMs(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 function concatBuffers(...parts) {
   const length = parts.reduce((total, part) => total + part.length, 0);
@@ -252,9 +439,17 @@ function encodeAgentModelParameter(parameter) {
   ));
 }
 
-function encodeRequestedAgentModel(model, selection = null) {
+function encodeRequestedAgentModel(model, selection = null, reasoningEffort = null) {
   const modelId = selection?.modelId || model;
-  const parameters = (selection?.parameters || [])
+  const rawParameters = [...(selection?.parameters || [])];
+  const effort = String(reasoningEffort || "").toLowerCase();
+  if (effort && effort !== "none") {
+    const value = effort === "ultra" ? "max" : effort === "minimal" ? "low" : effort;
+    const existingIndex = rawParameters.findIndex((parameter) => ["effort", "reasoning"].includes(parameter?.id));
+    if (existingIndex >= 0) rawParameters[existingIndex] = { ...rawParameters[existingIndex], value };
+    else rawParameters.push({ id: /gpt-/i.test(modelId) ? "reasoning" : "effort", value });
+  }
+  const parameters = rawParameters
     .map(encodeAgentModelParameter)
     .filter(Boolean);
   return concatBuffers(
@@ -268,9 +463,11 @@ function encodeRequestedAgentModel(model, selection = null) {
 
 function shouldResolveCursorModel(model) {
   return typeof model === "string" && (
-    model.startsWith("cursor-")
+    model === "auto"
+    || model === "default"
+    || model.startsWith("cursor-")
     || /(?:^|-)fast(?:-|$)/i.test(model)
-    || /(?:^|-)x?(?:high|medium|low)(?:-|$)/i.test(model)
+    || /(?:^|-)x?(?:high|medium|low|max|ultra)(?:-|$)/i.test(model)
     || /(?:^|-)thinking(?:-|$)/i.test(model)
     || /\[[^\]]+=/.test(model)
   );
@@ -317,7 +514,7 @@ function extractCursorToolResults(body) {
       results.push({
         toolName: decodeXmlEntities(toolName).trim(),
         toolCallId: normalizeAgentToolCallId(decodeXmlEntities(toolCallId)),
-        content: decodeXmlEntities(result),
+        content: capCursorToolResult(decodeXmlEntities(result)),
         isError: decodeXmlEntities(isError).trim() === "true",
       });
     }
@@ -439,29 +636,38 @@ function toolCallsFromMessage(message) {
 function toolResultsFromMessage(message) {
   if (!Array.isArray(message?.tool_results) || message.tool_results.length === 0) return "";
   return message.tool_results.map((result) =>
-    `[Tool result ${result?.tool_call_id || ""}${result?.tool_name ? ` (${result.tool_name})` : ""}]\n${result?.result_content || result?.result || ""}`
+    `[Tool result ${result?.tool_call_id || ""}${result?.tool_name ? ` (${result.tool_name})` : ""}]\n${capCursorToolResult(result?.result_content || result?.result || "")}`
   ).join("\n");
 }
 
 function encodeHistoryMessage(message) {
-  const contentParts = [textFromContent(message?.content)];
+  const rawContent = textFromContent(message?.content);
+  const content = message?.role === "tool"
+    ? capCursorToolResult(rawContent)
+    : capCursorToolXml(rawContent);
+  const contentParts = [content];
   if (message?.role === "assistant") contentParts.push(toolCallsFromMessage(message));
   if (message?.role === "assistant") contentParts.push(toolResultsFromMessage(message));
   if (message?.role === "tool") {
     contentParts.unshift(`[Tool result ${message.tool_call_id || ""}${message.name ? ` (${message.name})` : ""}]`);
   }
-  const content = contentParts.filter(Boolean).join("\n");
-  if (!content) return null;
+  const encodedContent = contentParts.filter(Boolean).join("\n");
+  if (!encodedContent) return null;
 
   // ConversationHistoryMessage.user / .assistant -> repeated content -> text.
-  const text = agentString(1, content);
+  const text = agentString(1, encodedContent);
   if (message.role === "assistant") {
     return agentMessage(2, agentMessage(1, agentMessage(1, text)));
   }
   return agentMessage(1, agentMessage(1, agentMessage(1, text)));
 }
 
-export function buildAgentRunFrame(messages, model, tools = [], modelSelection = null) {
+export function buildAgentRunFrame(messages, model, tools = [], modelSelection = null, reasoningEffort = null, resume = null) {
+  // resume = { conversationId, checkpoint } — continue a stored Cursor conversation
+  // instead of replaying the whole history as fresh context.
+  const checkpoint = resume?.checkpoint || null;
+  const conversationId = resume?.conversationId || null;
+  if (!checkpoint) messages = compactCursorMessages(messages, model, tools);
   const system = messages
     .filter((message) => message?.role === "system")
     .map((message) => textFromContent(message.content))
@@ -470,13 +676,18 @@ export function buildAgentRunFrame(messages, model, tools = [], modelSelection =
   const chatMessages = messages.filter((message) => message?.role !== "system");
   const currentIndex = [...chatMessages].map((message) => message?.role).findLastIndex((role) => role === "user" || role === "tool");
   const current = currentIndex >= 0 ? chatMessages[currentIndex] : chatMessages.at(-1);
-  const history = chatMessages
-    .slice(0, currentIndex >= 0 ? currentIndex : -1)
-    .map(encodeHistoryMessage)
-    .filter(Boolean);
+  // With a checkpoint the conversation state already holds prior turns; send only
+  // the current user message so Cursor resumes instead of replaying history.
+  const history = !checkpoint
+    ? chatMessages
+      .slice(0, currentIndex >= 0 ? currentIndex : -1)
+      .map(encodeHistoryMessage)
+      .filter(Boolean)
+    : [];
+  const rawCurrentText = textFromContent(current?.content);
   const currentText = current?.role === "tool"
-    ? [`[Tool result ${current.tool_call_id || ""}${current.name ? ` (${current.name})` : ""}]`, textFromContent(current.content)].filter(Boolean).join("\n")
-    : textFromContent(current?.content);
+    ? [`[Tool result ${current.tool_call_id || ""}${current.name ? ` (${current.name})` : ""}]`, capCursorToolResult(rawCurrentText)].filter(Boolean).join("\n")
+    : capCursorToolXml(rawCurrentText);
   const userText = currentText || "Continue.";
 
   // agent.v1.UserMessageAction.user_message and its optional history.
@@ -492,12 +703,13 @@ export function buildAgentRunFrame(messages, model, tools = [], modelSelection =
     ...(conversationHistory ? [agentMessage(7, conversationHistory)] : []),
   );
   const conversationAction = agentMessage(1, userAction);
-  const requestedModel = encodeRequestedAgentModel(model, modelSelection);
+  const requestedModel = encodeRequestedAgentModel(model, modelSelection, reasoningEffort);
   const runRequest = concatBuffers(
     // An empty ConversationStateStructure starts a fresh local agent session.
-    agentMessage(1, new Uint8Array()),
+    agentMessage(1, checkpoint || new Uint8Array()),
     agentMessage(2, conversationAction),
     ...(tools.length ? [agentMessage(4, encodeMcpTools(tools))] : []),
+    ...(conversationId ? [agentString(5, conversationId)] : []),
     ...(system ? [agentString(8, system)] : []),
     agentMessage(9, requestedModel),
   );
@@ -574,7 +786,7 @@ function createListMcpResourcesResponse(execRequest) {
 }
 
 function createMcpResultResponse(pending, content, isError = false) {
-  const mcpResult = encodeMcpResultSuccess({ textItems: [content], isError });
+  const mcpResult = encodeMcpResultSuccess({ textItems: [capCursorToolResult(content)], isError });
   const execClientMessage = concatBuffers(
     ...(pending.id != null ? [encodeField(1, PROTOBUF_VARINT, pending.id)] : []),
     agentMessage(11, mcpResult),
@@ -746,7 +958,7 @@ export class CursorExecutor extends BaseExecutor {
     // Do NOT call openaiToCursorRequest again — double-translation drops tool_results
     const messages = body.messages || [];
     const tools = body.tools || [];
-    const reasoningEffort = body.reasoning_effort || null;
+    const reasoningEffort = body.reasoning_effort || body.reasoning?.effort || null;
     // Detect Claude Code UA to force Agent mode (issue #643)
     const ua = credentials?.rawHeaders?.["user-agent"] || "";
     const forceAgentMode = ua.includes("claude-cli") || ua.includes("claude-code") || ua.includes("Claude Code");
@@ -940,245 +1152,381 @@ export class CursorExecutor extends BaseExecutor {
 
     const toolResults = extractCursorToolResults(body);
     const sessionOwner = agentSessionOwner(credentials, model);
-    const retained = acquireRetainedAgentSession(sessionOwner, toolResults);
-    let retainedState = retained?.state || null;
-    let keepSessionOpen = false;
-    let session;
-    let responseHeaders;
-    const closeRetainedOnAbort = () => {
-      if (retainedState) closeRetainedAgentSession(retainedState);
-    };
-    if (requestController.signal.aborted) closeRetainedOnAbort();
-    else requestController.signal.addEventListener("abort", closeRetainedOnAbort, { once: true });
-    traceLog(runId, `tool_results=${JSON.stringify(toolResults)} retained=${Boolean(retainedState)}`);
-    try {
-      if (requestController.signal.aborted) throw new Error("Request aborted");
-      if (retainedState) {
-        session = retainedState.session;
-        consumeRetainedToolResults(retainedState, retained.matchedResults);
-        keepSessionOpen = true;
-        responseHeaders = { ":status": 200 };
-        debugLog(
-          `[CURSOR AGENT ${runId}] Resume messages=${body.messages?.length || 0}, `
-          + `toolResults=${retained.matchedResults.map((result) => result.toolCallId).join(",")}`
-        );
-        traceLog(runId, `resume=${JSON.stringify(retained.matchedResults)}`);
-      } else {
-        session = this.openAgentHttp2Stream(url, headers, requestController.signal);
-        debugLog(
-          `[CURSOR AGENT ${runId}] Run model=${model}, messages=${body.messages?.length || 0}, `
-          + `roles=${(body.messages || []).map((message) => message?.role || "?").join(",")}, `
-          + `tools=${body.tools?.length || 0}`
-        );
-        traceLog(runId, `request=${JSON.stringify({ model, stream, body })}`);
-        const modelSelection = modelCatalog !== undefined
-          ? resolveCursorModelSelection(modelCatalog, model)
-          : shouldResolveCursorModel(model)
-            ? await resolveCursorModel(credentials, model, { signal: requestController.signal, log })
-            : null;
-        if (modelSelection) {
-          debugLog(
-            `[CURSOR AGENT ${runId}] Catalog model=${modelSelection.modelId}, `
-            + `matchedBy=${modelSelection.matchedBy}, params=${modelSelection.parameters?.length || 0}`,
-          );
-        }
-        const runFrame = buildAgentRunFrame(body.messages || [], model, body.tools || [], modelSelection);
-        traceLog(runId, `client_frame length=${runFrame.length} base64=${Buffer.from(runFrame).toString("base64")}`);
-        session.write(runFrame);
-        responseHeaders = await session.responseHeaders;
-      }
-    } catch (error) {
-      if (retainedState) closeRetainedAgentSession(retainedState);
-      else try { session?.close(); } catch {}
-      throw new Error(`Cursor AgentService request failed: ${error.message}`);
+    const userTexts = extractUserTexts(body);
+    const conv = getAgentConversation(sessionOwner);
+    if (!validateConversationLineage(conv, userTexts)) {
+      traceLog(runId, `lineage_mismatch reset conv=${conv.conversationId.slice(0, 8)}`);
+      resetAgentConversation(conv);
     }
 
-    if (!responseHeaders) {
-      try {
-        responseHeaders = await session.responseHeaders;
-      } catch (error) {
-        session.close();
-        throw new Error(`Cursor AgentService request failed: ${error.message}`);
-      }
+    const reasoningEffort = body.reasoning_effort || body.reasoning?.effort || null;
+    const modelSelection = modelCatalog !== undefined
+      ? resolveCursorModelSelection(modelCatalog, model)
+      : shouldResolveCursorModel(model)
+        ? await resolveCursorModel(credentials, model, { signal: requestController.signal, log })
+        : null;
+    if (modelSelection) {
+      debugLog(
+        `[CURSOR AGENT ${runId}] Catalog model=${modelSelection.modelId}, `
+        + `matchedBy=${modelSelection.matchedBy}, params=${modelSelection.parameters?.length || 0}`,
+      );
     }
 
-    const status = Number(responseHeaders[":status"] || 0);
-    if (status !== 200) {
-      let errorText = "";
-      try {
-        while (true) {
-          const { done, value } = await session.read();
-          if (done) break;
-          errorText += Buffer.from(value).toString("utf8");
-        }
-      } catch {}
-      session.close();
-      return {
-        response: new Response(JSON.stringify({
-          error: { message: `Cursor AgentService ${status}: ${errorText || "request failed"}`, type: "api_error" },
-        }), { status: status || HTTP_STATUS.SERVER_ERROR, headers: { "Content-Type": "application/json" } }),
-        url,
-        headers,
-        transformedBody: body,
-        responseFormat: FORMATS.OPENAI,
-      };
-    }
+    // Cursor's AgentService streams thinking deltas for OpenAI-format clients.
+    // Claude Code (Anthropic) requires cryptographically signed thinking blocks,
+    // so reasoning stays upstream-only for that UA (issue #643).
+    const ua = credentials?.rawHeaders?.["user-agent"] || "";
+    const forwardThinking = !(ua.includes("claude-cli") || ua.includes("claude-code") || ua.includes("Claude Code"));
 
     // The Claude SSE translator derives Anthropic's message ID by stripping
     // `chatcmpl-`. Keep the remaining ID in Anthropic's required `msg_` form
     // so strict clients such as Claude Code accept the completed stream.
     const responseId = `chatcmpl-msg_${Date.now()}`;
     const created = Math.floor(Date.now() / 1000);
-    let pending = retainedState?.buffered || Buffer.alloc(0);
-    if (retainedState) retainedState.buffered = Buffer.alloc(0);
-    let finished = false;
 
-    const consume = async (onEvent) => {
-      let heartbeatTimer;
-      let safetyTimer;
+    // Build the run frame against the current conversation state. Rebuilt per
+    // attempt so a blob_not_found reset (new conversation ID) is picked up.
+    const buildRunFrame = () => buildAgentRunFrame(
+      body.messages || [],
+      model,
+      body.tools || [],
+      modelSelection,
+      reasoningEffort,
+      conv.conversationId ? { conversationId: conv.conversationId, checkpoint: conv.checkpoint } : null,
+    );
+
+    // One full attempt: (re)open the session, write the run frame, consume.
+    // Emits events via onEvent. Retryable failures throw an Error whose
+    // message classifies via classifyCursorError (blob_not_found / resource_exhausted).
+    const runAttempt = async (onEvent) => {
+      const retained = acquireRetainedAgentSession(sessionOwner, toolResults);
+      let retainedState = retained?.state || null;
+      let keepSessionOpen = false;
+      let session;
+      let responseHeaders;
+      const closeRetainedOnAbort = () => {
+        if (retainedState) closeRetainedAgentSession(retainedState);
+      };
+      if (requestController.signal.aborted) closeRetainedOnAbort();
+      else requestController.signal.addEventListener("abort", closeRetainedOnAbort, { once: true });
+      traceLog(runId, `tool_results=${JSON.stringify(toolResults)} retained=${Boolean(retainedState)}`);
       try {
-        heartbeatTimer = setInterval(() => {
-          if (!finished) {
-            try { session.write(encodeAgentHeartbeat()); } catch {}
-          }
-        }, CURSOR_AGENT_HEARTBEAT_MS);
-        heartbeatTimer.unref?.();
-        safetyTimer = setTimeout(() => {
-          if (finished) return;
-          finished = true;
-          try { session.close(); } catch {}
-          onEvent({ type: "error", value: "Cursor AgentService stream timed out" });
-        }, CURSOR_AGENT_STREAM_TIMEOUT_MS);
-        safetyTimer.unref?.();
-        while (!finished) {
-          pending = decodeAgentFrames(pending, (payload) => {
-            // A single read can carry several frames; once the turn is over the
-            // remaining complete frames stay buffered for the retained resume.
-            if (finished) return false;
-            traceLog(runId, `server_frame length=${payload.length} base64=${Buffer.from(payload).toString("base64")}`);
-            const serverMessage = decodeMessage(payload);
-            debugLog(`[CURSOR AGENT ${runId}] Server fields: ${describeAgentFields(serverMessage)}`);
-
-            // KV is a bidirectional side channel. Echo opaque metadata exactly;
-            // dropping it makes Cursor silently ignore otherwise valid replies.
-            const kvEvent = decodeAgentKvServerEvent(payload);
-            if (kvEvent) {
-              if (kvEvent.kind === "get") {
-                session.write(encodeAgentKvGetResult(kvEvent.id, new Uint8Array(), kvEvent.metadata));
-              } else {
-                session.write(encodeAgentKvSetResult(kvEvent.id, kvEvent.metadata));
-              }
-              return true;
-            }
-
-            // agent.v1.AgentServerMessage.interaction_update
-            if (serverMessage.has(1)) {
-              const update = decodeMessage(serverMessage.get(1)[0].value);
-              traceInteractionUpdate(runId, update);
-              if (update.has(1)) {
-                const textDelta = extractAgentString(decodeMessage(update.get(1)[0].value), 1);
-                if (textDelta) onEvent({ type: "text", value: textDelta });
-              }
-              // Cursor's AgentService emits internal reasoning without the
-              // cryptographic signature required by Anthropic thinking blocks.
-              // Forwarding it makes strict Anthropic clients (Claude Code)
-              // discard or wait on an otherwise complete response. Keep the
-              // reasoning upstream-only and emit the normal answer text.
-              if (update.has(14)) {
-                finished = true;
-                onEvent({ type: "done" });
-                return false;
-              }
-            }
-
-            // AgentService requests IDE context before producing a response.
-            // Return an empty context; 9router is not coupled to an editor.
-            if (serverMessage.has(2)) {
-              const execRequest = decodeMessage(serverMessage.get(2)[0].value);
-              traceLog(runId, `exec_request fields=${describeAgentFields(execRequest)}`);
-              const execEvent = decodeExecServerEvent(payload);
-              if (execEvent?.kind === "exec_request_context") {
-                // Include declared MCP tools in the context envelope. Cursor
-                // versions that require context-local tool discovery otherwise
-                // accept the handshake but never expose the tools to the model.
-                session.write(createRequestContextResponse(execRequest, body.tools || []));
-              } else if (execEvent?.kind === "exec_list_mcp_resources") {
-                session.write(encodeAgentEmptyListMcpResources(execEvent.execMsgId, execEvent.execId));
-              } else if (execEvent?.kind === "exec_mcp") {
-                const toolCallId = normalizeAgentToolCallId(
-                  execEvent.toolCallId || execEvent.execId || `call_${crypto.randomUUID()}`
-                );
-                const toolName = execEvent.toolName || "tool";
-                retainedState = retainAgentToolCall(session, sessionOwner, toolCallId, execRequest);
-                keepSessionOpen = true;
-                traceLog(runId, `mcp_exec tool=${toolName} call_id=${toolCallId} args=${JSON.stringify(execEvent.args || {})}`);
-                finished = true;
-                onEvent({
-                  type: "tool_call",
-                  value: {
-                    id: toolCallId,
-                    type: "function",
-                    function: {
-                      name: toolName,
-                      arguments: JSON.stringify(execEvent.args || {}),
-                    },
-                  },
-                });
-                return false;
-              } else if (execEvent) {
-                // Typed rejection lets Cursor continue/fallback instead of
-                // wedging the bidirectional stream on an IDE-only operation.
-                handleNativeExec(execEvent, session);
-              } else {
-                debugLog(`[CURSOR AGENT ${runId}] Unsupported exec request fields: ${describeAgentFields(execRequest)}`);
-                finished = true;
-                onEvent({ type: "error", value: "Cursor AgentService requested an unsupported IDE tool" });
-                return false;
-              }
-            }
-
-            if (serverMessage.has(7)) {
-              const query = Buffer.from(serverMessage.get(7)[0].value);
-              const interaction = decodeAgentInteractionQuery(query);
-              if (interaction?.kind) {
-                // Auto-approve harmless searches/fetches so the agent loop
-                // never stalls waiting on an IDE dialog; reject questions,
-                // mode switches, and plan writes (no UI here to answer).
-                const approved = [2, 5, 6, 8, 9].includes(interaction.kind);
-                const reason = "Interaction unavailable in headless proxy mode";
-                const response = encodeAgentInteractionResponse(interaction.id, interaction.kind, approved, reason);
-                if (response) session.write(response);
-                traceLog(runId, `interaction_query kind=${interaction.kind} id=${interaction.id} approved=${approved}`);
-              } else {
-                traceLog(
-                  runId,
-                  `interaction_query fields=${describeAgentFields(decodeMessage(query))} base64=${query.toString("base64")}`
-                );
-              }
-            }
-            return true;
-          });
-          if (finished) break;
-          const { done, value } = await session.read();
-          if (done) break;
-          pending = Buffer.concat([pending, Buffer.from(value)]);
+        if (requestController.signal.aborted) throw new Error("Request aborted");
+        if (retainedState) {
+          session = retainedState.session;
+          consumeRetainedToolResults(retainedState, retained.matchedResults);
+          keepSessionOpen = true;
+          responseHeaders = { ":status": 200 };
+          debugLog(
+            `[CURSOR AGENT ${runId}] Resume messages=${body.messages?.length || 0}, `
+            + `toolResults=${retained.matchedResults.map((result) => result.toolCallId).join(",")}`
+          );
+          traceLog(runId, `resume=${JSON.stringify(retained.matchedResults)}`);
+        } else {
+          session = this.openAgentHttp2Stream(url, headers, requestController.signal);
+          debugLog(
+            `[CURSOR AGENT ${runId}] Run model=${model}, messages=${body.messages?.length || 0}, `
+            + `roles=${(body.messages || []).map((message) => message?.role || "?").join(",")}, `
+            + `tools=${body.tools?.length || 0}`
+          );
+          traceLog(runId, `request=${JSON.stringify({ model, stream, body })}`);
+          const runFrame = buildRunFrame();
+          traceLog(runId, `client_frame length=${runFrame.length} base64=${Buffer.from(runFrame).toString("base64")}`);
+          session.write(runFrame);
+          responseHeaders = await session.responseHeaders;
         }
       } catch (error) {
         if (retainedState) closeRetainedAgentSession(retainedState);
-        throw error;
-      } finally {
-        if (heartbeatTimer) clearInterval(heartbeatTimer);
-        if (safetyTimer) clearTimeout(safetyTimer);
-        traceLog(runId, `consume_finally finished=${finished} pending=${pending.length}`);
-        if (keepSessionOpen && retainedState) {
-          retainedState.buffered = pending;
-          releaseRetainedAgentSession(retainedState, true);
-        } else {
-          try { session.end(); } catch {}
-          try { session.close(); } catch {}
-        }
-        if (!finished) onEvent({ type: "done" });
+        else try { session?.close(); } catch {}
+        throw new Error(`Cursor AgentService request failed: ${error.message}`);
       }
+
+      if (!responseHeaders) {
+        try {
+          responseHeaders = await session.responseHeaders;
+        } catch (error) {
+          session.close();
+          throw new Error(`Cursor AgentService request failed: ${error.message}`);
+        }
+      }
+
+      const status = Number(responseHeaders[":status"] || 0);
+      if (status !== 200) {
+        let errorText = "";
+        try {
+          while (true) {
+            const { done, value } = await session.read();
+            if (done) break;
+            errorText += Buffer.from(value).toString("utf8");
+          }
+        } catch {}
+        session.close();
+        const hint = classifyCursorError(errorText);
+        if (hint) {
+          const err = new Error(hint);
+          err.retryHint = hint;
+          throw err;
+        }
+        return {
+          response: new Response(JSON.stringify({
+            error: { message: `Cursor AgentService ${status}: ${errorText || "request failed"}`, type: "api_error" },
+          }), { status: status || HTTP_STATUS.SERVER_ERROR, headers: { "Content-Type": "application/json" } }),
+          url,
+          headers,
+          transformedBody: body,
+          responseFormat: FORMATS.OPENAI,
+        };
+      }
+
+      let pending = retainedState?.buffered || Buffer.alloc(0);
+      if (retainedState) retainedState.buffered = Buffer.alloc(0);
+      let finished = false;
+      let timedOut = false;
+
+      const consume = async () => {
+        let heartbeatTimer;
+        let safetyTimer;
+        try {
+          heartbeatTimer = setInterval(() => {
+            if (!finished) {
+              try { session.write(encodeAgentHeartbeat()); } catch {}
+            }
+          }, CURSOR_AGENT_HEARTBEAT_MS);
+          heartbeatTimer.unref?.();
+          safetyTimer = setTimeout(() => {
+            if (finished) return;
+            finished = true;
+            timedOut = true;
+            try { session.close(); } catch {}
+          }, CURSOR_AGENT_STREAM_TIMEOUT_MS);
+          safetyTimer.unref?.();
+          while (!finished) {
+            pending = decodeAgentFrames(pending, (payload) => {
+              // A single read can carry several frames; once the turn is over the
+              // remaining complete frames stay buffered for the retained resume.
+              if (finished) return false;
+              traceLog(runId, `server_frame length=${payload.length} base64=${Buffer.from(payload).toString("base64")}`);
+              const serverMessage = decodeMessage(payload);
+              debugLog(`[CURSOR AGENT ${runId}] Server fields: ${describeAgentFields(serverMessage)}`);
+
+              // KV is a bidirectional side channel. GetBlob answers from the
+              // per-conversation blob store; SetBlob stores for later turns
+              // (pi-cursor parity — an empty GetBlob breaks long conversations).
+              const kvEvent = decodeAgentKvServerEvent(payload);
+              if (kvEvent) {
+                if (kvEvent.kind === "get") {
+                  const key = Buffer.from(kvEvent.blobId).toString("hex");
+                  const blob = conv.blobStore.get(key);
+                  if (!blob) traceLog(runId, `blob_get_miss key=${key.slice(0, 16)} store=${conv.blobStore.size}`);
+                  session.write(encodeAgentKvGetResult(kvEvent.id, blob || new Uint8Array(), kvEvent.metadata));
+                } else {
+                  conv.blobStore.set(Buffer.from(kvEvent.blobId).toString("hex"), kvEvent.blobData);
+                  pruneAgentBlobs(conv.blobStore);
+                  session.write(encodeAgentKvSetResult(kvEvent.id, kvEvent.metadata));
+                }
+                return true;
+              }
+
+              // agent.v1.AgentServerMessage.conversation_checkpoint_update (field 3).
+              // Persist the serialized conversation state so the next turn resumes
+              // this conversation instead of replaying history (pi-cursor parity).
+              if (serverMessage.has(3)) {
+                const bytes = Buffer.from(serverMessage.get(3)[0].value);
+                if (bytes.length) {
+                  conv.checkpoint = bytes;
+                  try {
+                    // ConversationStateStructure.token_details (field 5) →
+                    // { used_tokens: 1, max_tokens: 2 }
+                    const state = decodeMessage(bytes);
+                    const td = state.get(5)?.[0];
+                    if (td && td.wireType === PROTOBUF_LEN) {
+                      const details = decodeMessage(td.value);
+                      const used = extractAgentVarint(details, 1);
+                      const max = extractAgentVarint(details, 2);
+                      if (typeof used === "number") conv.tokenUsage = { used, max: typeof max === "number" ? max : null };
+                    }
+                  } catch {}
+                  traceLog(runId, `checkpoint bytes=${bytes.length}`);
+                }
+                return true;
+              }
+
+              // agent.v1.AgentServerMessage.interaction_update
+              if (serverMessage.has(1)) {
+                const update = decodeMessage(serverMessage.get(1)[0].value);
+                traceInteractionUpdate(runId, update);
+                if (update.has(1)) {
+                  const textDelta = extractAgentString(decodeMessage(update.get(1)[0].value), 1);
+                  if (textDelta) onEvent({ type: "text", value: textDelta });
+                }
+                if (update.has(4) && forwardThinking) {
+                  const thinkingDelta = extractAgentString(decodeMessage(update.get(4)[0].value), 1);
+                  if (thinkingDelta) onEvent({ type: "thinking", value: thinkingDelta });
+                }
+                if (update.has(8)) {
+                  try {
+                    const tokenDelta = decodeMessage(update.get(8)[0].value);
+                    const tokens = extractAgentVarint(tokenDelta, 1);
+                    if (typeof tokens === "number" && tokens > 0) conv.outputTokens += tokens;
+                  } catch {}
+                }
+                if (update.has(14)) {
+                  finished = true;
+                  onEvent({ type: "done" });
+                  return false;
+                }
+              }
+
+              // AgentService requests IDE context before producing a response.
+              // Return an empty context; 9router is not coupled to an editor.
+              if (serverMessage.has(2)) {
+                const execRequest = decodeMessage(serverMessage.get(2)[0].value);
+                traceLog(runId, `exec_request fields=${describeAgentFields(execRequest)}`);
+                const execEvent = decodeExecServerEvent(payload);
+                if (execEvent?.kind === "exec_request_context") {
+                  // Include declared MCP tools in the context envelope. Cursor
+                  // versions that require context-local tool discovery otherwise
+                  // accept the handshake but never expose the tools to the model.
+                  session.write(createRequestContextResponse(execRequest, body.tools || []));
+                } else if (execEvent?.kind === "exec_list_mcp_resources") {
+                  session.write(encodeAgentEmptyListMcpResources(execEvent.execMsgId, execEvent.execId));
+                } else if (execEvent?.kind === "exec_mcp") {
+                  const toolCallId = normalizeAgentToolCallId(
+                    execEvent.toolCallId || execEvent.execId || `call_${crypto.randomUUID()}`
+                  );
+                  const toolName = execEvent.toolName || "tool";
+                  retainedState = retainAgentToolCall(session, sessionOwner, toolCallId, execRequest);
+                  keepSessionOpen = true;
+                  traceLog(runId, `mcp_exec tool=${toolName} call_id=${toolCallId} args=${JSON.stringify(execEvent.args || {})}`);
+                  finished = true;
+                  onEvent({
+                    type: "tool_call",
+                    value: {
+                      id: toolCallId,
+                      type: "function",
+                      function: {
+                        name: toolName,
+                        arguments: JSON.stringify(execEvent.args || {}),
+                      },
+                    },
+                  });
+                  return false;
+                } else if (execEvent) {
+                  // Typed rejection lets Cursor continue/fallback instead of
+                  // wedging the bidirectional stream on an IDE-only operation.
+                  handleNativeExec(execEvent, session);
+                } else {
+                  debugLog(`[CURSOR AGENT ${runId}] Unsupported exec request fields: ${describeAgentFields(execRequest)}`);
+                  finished = true;
+                  onEvent({ type: "error", value: "Cursor AgentService requested an unsupported IDE tool" });
+                  return false;
+                }
+              }
+
+              if (serverMessage.has(7)) {
+                const query = Buffer.from(serverMessage.get(7)[0].value);
+                const interaction = decodeAgentInteractionQuery(query);
+                if (interaction?.kind) {
+                  // Auto-approve harmless searches/fetches so the agent loop
+                  // never stalls waiting on an IDE dialog; reject questions,
+                  // mode switches, and plan writes (no UI here to answer).
+                  const approved = [2, 5, 6, 8, 9].includes(interaction.kind);
+                  const reason = "Interaction unavailable in headless proxy mode";
+                  const response = encodeAgentInteractionResponse(interaction.id, interaction.kind, approved, reason);
+                  if (response) session.write(response);
+                  traceLog(runId, `interaction_query kind=${interaction.kind} id=${interaction.id} approved=${approved}`);
+                } else {
+                  traceLog(
+                    runId,
+                    `interaction_query fields=${describeAgentFields(decodeMessage(query))} base64=${query.toString("base64")}`
+                  );
+                }
+              }
+              return true;
+            });
+            if (finished) break;
+            const { done, value } = await session.read();
+            if (done) break;
+            pending = Buffer.concat([pending, Buffer.from(value)]);
+          }
+        } catch (error) {
+          if (retainedState) closeRetainedAgentSession(retainedState);
+          const hint = classifyCursorError(error.message);
+          if (hint && !outputStarted) {
+            const err = new Error(hint);
+            err.retryHint = hint;
+            throw err;
+          }
+          throw error;
+        } finally {
+          if (heartbeatTimer) clearInterval(heartbeatTimer);
+          if (safetyTimer) clearTimeout(safetyTimer);
+          traceLog(runId, `consume_finally finished=${finished} pending=${pending.length}`);
+          if (keepSessionOpen && retainedState) {
+            retainedState.buffered = pending;
+            releaseRetainedAgentSession(retainedState, true);
+          } else {
+            try { session.end(); } catch {}
+            try { session.close(); } catch {}
+          }
+          if (timedOut && !outputStarted) {
+            const err = new Error("timeout");
+            err.retryHint = "timeout";
+            throw err;
+          }
+          if (!finished && !timedOut) onEvent({ type: "done" });
+        }
+      };
+
+      await consume();
+      return { keepSessionOpen, retainedState };
+    };
+
+    // Wrap events so we can refuse to retry once real output has started.
+    let outputStarted = false;
+    const makeWrappedEvent = (onEvent) => (event) => {
+      if (event.type === "text" || event.type === "thinking" || event.type === "tool_call") outputStarted = true;
+      onEvent(event);
+    };
+
+    // Retry loop: fresh session per attempt; blob_not_found resets the
+    // conversation (new ID) so Cursor replays from client history.
+    const runWithRetry = async (onEvent) => {
+      outputStarted = false;
+      const wrapped = makeWrappedEvent(onEvent);
+      let attempt = 0;
+      for (;;) {
+        try {
+          const result = await runAttempt(wrapped);
+          // Commit lineage only after a successful attempt (done or tool_call).
+          commitConversationTurn(conv, userTexts);
+          return result;
+        } catch (error) {
+          const hint = error.retryHint || classifyCursorError(error.message);
+          if (!hint || attempt >= CURSOR_AGENT_MAX_RETRIES || outputStarted) throw error;
+          attempt++;
+          if (hint === "blob_not_found") {
+            traceLog(runId, `retry blob_not_found: reset conversation`);
+            resetAgentConversation(conv);
+          }
+          traceLog(runId, `retry ${attempt}/${CURSOR_AGENT_MAX_RETRIES} hint=${hint}`);
+          await sleepMs(retryDelayMs(hint));
+        }
+      }
+    };
+
+    const buildAgentUsage = (contentLength) => {
+      const tokenUsage = conv.tokenUsage;
+      const output = conv.outputTokens || 0;
+      if (tokenUsage?.used) {
+        const total = Math.max(output, tokenUsage.used);
+        return {
+          prompt_tokens: Math.max(0, total - output),
+          completion_tokens: output,
+          total_tokens: total,
+        };
+      }
+      return estimateUsage(body, contentLength, FORMATS.OPENAI);
     };
 
     if (stream === false) {
@@ -1186,7 +1534,9 @@ export class CursorExecutor extends BaseExecutor {
       let reasoning = "";
       let toolCall = null;
       let agentError = null;
-      await consume((event) => {
+      // Connection/stream failures propagate (reject) so callers treat them as
+      // transport errors; only agent-level protocol errors become BAD_REQUEST.
+      await runWithRetry((event) => {
         if (event.type === "text") content += event.value;
         else if (event.type === "thinking") reasoning += event.value;
         else if (event.type === "tool_call") toolCall = event.value;
@@ -1220,7 +1570,7 @@ export class CursorExecutor extends BaseExecutor {
             },
             finish_reason: toolCall ? "tool_calls" : "stop",
           }],
-          usage: estimateUsage(body, content.length, FORMATS.OPENAI),
+          usage: buildAgentUsage(content.length),
         }), { headers: { "Content-Type": "application/json" } }),
         url,
         headers,
@@ -1232,7 +1582,7 @@ export class CursorExecutor extends BaseExecutor {
     const encoder = new TextEncoder();
     const responseStream = new ReadableStream({
       start(controller) {
-        consume((event) => {
+        runWithRetry((event) => {
           if (event.type === "text") {
             controller.enqueue(encoder.encode(chatChunkSse({ id: responseId, created, model, delta: { content: event.value } })));
           } else if (event.type === "thinking") {

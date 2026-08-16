@@ -28,10 +28,14 @@ const USABLE_MODELS_FIELD = 1;
 // current Cursor model picker and includes canonical IDs plus variants.
 const AVAILABLE_MODELS_FIELD = 2;
 const AVAILABLE_MODEL_NAME_FIELD = 1;
+const AVAILABLE_MODEL_DEFAULT_ON_FIELD = 2;
+const AVAILABLE_MODEL_IS_CHAT_ONLY_FIELD = 4;
+const AVAILABLE_MODEL_SUPPORTS_AGENT_FIELD = 5;
 const AVAILABLE_MODEL_CLIENT_NAME_FIELD = 17;
 const AVAILABLE_MODEL_SERVER_NAME_FIELD = 18;
 const AVAILABLE_MODEL_INPUTBOX_NAME_FIELD = 24;
 const AVAILABLE_MODEL_VARIANTS_FIELD = 30;
+const AVAILABLE_MODEL_IS_HIDDEN_FIELD = 35;
 const AVAILABLE_MODEL_LEGACY_SLUGS_FIELD = 36;
 const AVAILABLE_MODEL_ID_ALIASES_FIELD = 37;
 const VARIANT_PARAMETERS_FIELD = 1;
@@ -186,6 +190,10 @@ export function parseCursorAvailableModels(payload) {
       id,
       name: clientDisplayName,
       serverModelName,
+      defaultOn: firstBool(fields, AVAILABLE_MODEL_DEFAULT_ON_FIELD),
+      isChatOnly: firstBool(fields, AVAILABLE_MODEL_IS_CHAT_ONLY_FIELD),
+      supportsAgent: firstBool(fields, AVAILABLE_MODEL_SUPPORTS_AGENT_FIELD),
+      isHidden: firstBool(fields, AVAILABLE_MODEL_IS_HIDDEN_FIELD),
       legacySlugs,
       idAliases,
       variants,
@@ -258,9 +266,28 @@ export function expandCursorModelAliases(models) {
  * Resolve a static/legacy model slug to the canonical AgentService model ID
  * and the exact parameter values selected by Cursor's model picker.
  */
+// Auto (server picks) is not a real AgentService model id — resolve it to the
+// account's default agent-capable model so Run is not rejected with an empty
+// turn. Prefer defaultOn, fall back to the first usable agent model.
+function resolveAutoModelSelection(models) {
+  if (!Array.isArray(models) || models.length === 0) return null;
+  const usable = models.filter((model) => model.supportsAgent && !model.isChatOnly && !model.isHidden);
+  if (usable.length === 0) return null;
+  const preferred = usable.find((model) => model.defaultOn) || usable[0];
+  return {
+    modelId: preferred.id,
+    parameters: [],
+    maxMode: false,
+    builtInModel: true,
+    isVariantStringRepresentation: false,
+    matchedBy: "auto-default",
+  };
+}
+
 export function resolveCursorModelSelection(models, requestedModel) {
   const requested = typeof requestedModel === "string" ? requestedModel.trim() : "";
   if (!requested || !Array.isArray(models)) return null;
+  if (requested === "auto" || requested === "default") return resolveAutoModelSelection(models);
 
   // A request with additional_model_names can make Cursor echo a legacy slug
   // as a synthetic exact model entry. Prefer the real variant metadata first.

@@ -21,6 +21,13 @@ const ROLE = { USER: 1, ASSISTANT: 2 };
 const UNIFIED_MODE = { CHAT: 1, AGENT: 2 };
 
 const THINKING_LEVEL = { UNSPECIFIED: 0, MEDIUM: 1, HIGH: 2 };
+
+function normalizeCursorThinkingLevel(reasoningEffort) {
+  const effort = String(reasoningEffort || "").toLowerCase();
+  if (["high", "xhigh", "max", "ultra"].includes(effort)) return THINKING_LEVEL.HIGH;
+  if (["low", "medium"].includes(effort)) return THINKING_LEVEL.MEDIUM;
+  return THINKING_LEVEL.UNSPECIFIED;
+}
 const CLIENT_SIDE_TOOL_V2 = { MCP: 19 };
 const CLIENT_SIDE_TOOL_V2_MCP = 19;
 
@@ -653,10 +660,9 @@ export function encodeRequest(messages, modelName, tools = [], reasoningEffort =
     messageIds.push({ messageId: msgId, role });
   }
 
-  // Map reasoning effort to thinking level
-  let thinkingLevel = THINKING_LEVEL.UNSPECIFIED;
-  if (reasoningEffort === "medium") thinkingLevel = THINKING_LEVEL.MEDIUM;
-  else if (reasoningEffort === "high") thinkingLevel = THINKING_LEVEL.HIGH;
+  // Cursor exposes medium/high on this legacy wire path. Clamp newer effort
+  // names to the nearest supported level instead of silently disabling thinking.
+  const thinkingLevel = normalizeCursorThinkingLevel(reasoningEffort);
 
   // Build request
   return concatArrays(

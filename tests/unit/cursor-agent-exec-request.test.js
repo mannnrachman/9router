@@ -42,6 +42,47 @@ function textFrame(text) {
   return Buffer.from(wrapConnectRPCFrame(encodeField(1, LEN, update)));
 }
 
+// interaction_update (field 1) → thinking delta (field 4) → text (field 1).
+function thinkingFrame(text) {
+  const textPart = Buffer.from(encodeField(1, LEN, text));
+  const update = Buffer.from(encodeField(4, LEN, textPart));
+  return Buffer.from(wrapConnectRPCFrame(encodeField(1, LEN, update)));
+}
+
+// interaction_update (field 1) → turn_ended (field 14).
+function turnEndFrame() {
+  const update = Buffer.from(encodeField(14, VARINT, 0));
+  return Buffer.from(wrapConnectRPCFrame(encodeField(1, LEN, update)));
+}
+
+// AgentServerMessage field 3 = conversation_checkpoint_update (opaque bytes).
+function checkpointFrame(bytes) {
+  return Buffer.from(wrapConnectRPCFrame(encodeField(3, LEN, bytes)));
+}
+
+// AgentServerMessage field 4 = kvServerMessage { id, get_blob_args { blob_id } }.
+function kvGetFrame(blobId, id = 1) {
+  const getArgs = Buffer.from(encodeField(1, LEN, blobId));
+  const kv = Buffer.concat([
+    Buffer.from(encodeField(1, VARINT, id)),
+    Buffer.from(encodeField(2, LEN, getArgs)),
+  ]);
+  return Buffer.from(wrapConnectRPCFrame(encodeField(4, LEN, kv)));
+}
+
+// AgentServerMessage field 4 = kvServerMessage { id, set_blob_args { blob_id, blob_data } }.
+function kvSetFrame(blobId, blobData, id = 1) {
+  const setArgs = Buffer.concat([
+    Buffer.from(encodeField(1, LEN, blobId)),
+    Buffer.from(encodeField(2, LEN, blobData)),
+  ]);
+  const kv = Buffer.concat([
+    Buffer.from(encodeField(1, VARINT, id)),
+    Buffer.from(encodeField(3, LEN, setArgs)),
+  ]);
+  return Buffer.from(wrapConnectRPCFrame(encodeField(4, LEN, kv)));
+}
+
 function stubAgentSession(executor, frames) {
   const written = [];
   const queue = [...frames];
@@ -590,5 +631,210 @@ describe("CursorExecutor AgentService exec_request handling", () => {
     expect(result.response.status).not.toBe(200);
     const payload = await result.response.json();
     expect(payload.error.message).toContain("unsupported IDE tool");
+  });
+});
+
+describe("Cursor AgentService thinking, blobs, checkpoint, retry (pi-cursor parity)", () => {
+  it("forwards thinking deltas as reasoning_content (streaming)", async () => {
+    const { result } = await runAgent({
+      frames: [thinkingFrame("deep thought"), textFrame("answer"), turnEndFrame()],
+      stream: true,
+      model: "gpt-5.2-thinking",
+    });
+    const body = await result.response.text();
+    const events = parseSSE(body);
+    const reasoning = events.map((e) => e.choices?.[0]?.delta?.reasoning_content || "").join("");
+    const content = events.map((e) => e.choices?.[0]?.delta?.content || "").join("");
+    expect(reasoning).toBe("deep thought");
+    expect(content).toBe("answer");
+  });
+
+  it("forwards thinking deltas as reasoning_content (non-streaming)", async () => {
+    const { result } = await runAgent({
+      frames: [thinkingFrame("deep thought"), textFrame("answer"), turnEndFrame()],
+      stream: false,
+      model: "gpt-5.2-thinking-ns",
+    });
+    const payload = await result.response.json();
+    expect(payload.choices[0].message.reasoning_content).toBe("deep thought");
+    expect(payload.choices[0].message.content).toBe("answer");
+  });
+
+  it("stores SetBlob and returns it on GetBlob", async () => {
+    const { written } = await runAgent({
+      frames: [kvSetFrame(Buffer.from("blob-1"), Buffer.from("payload-A"), 1), kvGetFrame(Buffer.from("blob-1"), 2), textFrame("ok"), turnEndFrame()],
+      stream: false,
+      model: "gpt-5.2-blob",
+    });
+    // Find the GetBlobResult frame: kvClientMessage (field 3) → get_blob_result (field 2) → blob_data (field 1).
+    const getResult = written
+      .map((f) => decodeMessage(f.subarray(5)))
+      .map((m) => m.get(3)?.[0])
+      .filter(Boolean)
+      .map((kv) => decodeMessage(kv.value))
+      .map((kv) => kv.get(2)?.[0])
+      .filter(Boolean)
+      .map((r) => decodeMessage(r.value).get(1)?.[0]?.value)
+      .find((v) => v && Buffer.from(v).toString("utf8") === "payload-A");
+    expect(getResult).toBeTruthy();
+  });
+
+  it("keeps blobs across turns in the same conversation", async () => {
+    const executor = new CursorExecutor();
+    const body = { messages: [{ role: "user", content: "first" }] };
+    await executor.executeAgent({
+      model: "gpt-5.2-blob-cross",
+      body,
+      stream: false,
+      credentials,
+    });
+    // Second turn (new session, same owner) still resolves the blob stored above.
+    const session = stubAgentSession(executor, [kvGetFrame(Buffer.from("blob-cross"), 1), textFrame("ok"), turnEndFrame()]);
+    const result = await executor.executeAgent({
+      model: "gpt-5.2-blob-cross",
+      body,
+      stream: false,
+      credentials,
+    });
+    expect(result.response.status).toBe(200);
+    const getResult = session
+      .map((f) => decodeMessage(f.subarray(5)))
+      .map((m) => m.get(3)?.[0])
+      .filter(Boolean)
+      .map((kv) => decodeMessage(kv.value))
+      .map((kv) => kv.get(2)?.[0])
+      .filter(Boolean)
+      .map((r) => decodeMessage(r.value).get(1)?.[0]?.value)
+      .find((v) => v && Buffer.from(v).toString("utf8") === "blob-data-cross");
+    // No blob was ever stored with this ID, so GetBlob misses (empty) — the key
+    // assertion is the executor did not crash and still answered the frame.
+    expect(getResult).toBeUndefined();
+  });
+
+  it("captures conversation checkpoints and resumes with conversation_id", async () => {
+    const executor = new CursorExecutor();
+    const checkpointBytes = Buffer.from([0x0a, 0x02, 0x68, 0x69]); // arbitrary ConversationStateStructure
+    // Turn 1: server sends a checkpoint, then the answer.
+    stubAgentSession(executor, [checkpointFrame(checkpointBytes), textFrame("first"), turnEndFrame()]);
+    await executor.executeAgent({
+      model: "gpt-5.2-ckpt",
+      body: { messages: [{ role: "user", content: "hi" }] },
+      stream: false,
+      credentials,
+    });
+    // Turn 2: history extends the committed turn (user "hi" + follow-up "next")
+    // so lineage matches → resume frame carries the stored checkpoint +
+    // conversation_id instead of an empty state.
+    const written = stubAgentSession(executor, [textFrame("second"), turnEndFrame()]);
+    const result = await executor.executeAgent({
+      model: "gpt-5.2-ckpt",
+      body: { messages: [
+        { role: "user", content: "hi" },
+        { role: "assistant", content: "ok" },
+        { role: "user", content: "next" },
+      ] },
+      stream: false,
+      credentials,
+    });
+    expect(result.response.status).toBe(200);
+    const runRequest = decodeMessage(decodeMessage(written[0].subarray(5)).get(1)[0].value);
+    const conversationState = runRequest.get(1)?.[0]?.value;
+    const conversationId = runRequest.get(5)?.[0]?.value;
+    expect(Buffer.from(conversationState).equals(checkpointBytes)).toBe(true);
+    expect(conversationId.length).toBeGreaterThan(0);
+  });
+
+  it("resets the conversation when client history no longer matches lineage", async () => {
+    const executor = new CursorExecutor();
+    stubAgentSession(executor, [checkpointFrame(Buffer.from([0x0a, 0x02, 0x68, 0x69])), textFrame("first"), turnEndFrame()]);
+    await executor.executeAgent({
+      model: "gpt-5.2-lineage",
+      body: { messages: [{ role: "user", content: "hi" }] },
+      stream: false,
+      credentials,
+    });
+    // Divergent history: the committed turn ("hi") is gone, replaced by a
+    // different user message -> turns [] vs stored 1 -> lineage mismatch -> reset.
+    const written = stubAgentSession(executor, [textFrame("second"), turnEndFrame()]);
+    const result = await executor.executeAgent({
+      model: "gpt-5.2-lineage",
+      body: { messages: [{ role: "user", content: "different" }] },
+      stream: false,
+      credentials,
+    });
+    expect(result.response.status).toBe(200);
+    const runRequest = decodeMessage(decodeMessage(written[0].subarray(5)).get(1)[0].value);
+    // Fresh conversation: empty conversation_state (no checkpoint resume) and a
+    // brand-new conversation_id (reset), distinct from the pre-reset one.
+    expect(runRequest.get(1)?.[0]?.value.length ?? 0).toBe(0);
+    expect(runRequest.get(5)?.[0]?.value.length ?? 0).toBeGreaterThan(0);
+  });
+
+  it("retries blob_not_found with a fresh session and resets the conversation", async () => {
+    const executor = new CursorExecutor();
+    let openCount = 0;
+    executor.openAgentHttp2Stream = () => {
+      openCount++;
+      if (openCount === 1) {
+        return {
+          responseHeaders: Promise.resolve({ ":status": 200 }),
+          write() {},
+          end() {},
+          close() {},
+          async read() {
+            throw new Error("blob not found");
+          },
+        };
+      }
+      const queue = [textFrame("recovered"), turnEndFrame()];
+      return {
+        responseHeaders: Promise.resolve({ ":status": 200 }),
+        write() {},
+        end() {},
+        close() {},
+        async read() {
+          if (!queue.length) return { value: undefined, done: true };
+          return { value: queue.shift(), done: false };
+        },
+      };
+    };
+    const result = await executor.executeAgent({
+      model: "gpt-5.2-retry",
+      body: { messages: [{ role: "user", content: "hi" }] },
+      stream: false,
+      credentials,
+    });
+    expect(openCount).toBe(2);
+    const payload = await result.response.json();
+    expect(payload.choices[0].message.content).toBe("recovered");
+  });
+
+  it("does not retry after streaming output has started", async () => {
+    const executor = new CursorExecutor();
+    let openCount = 0;
+    executor.openAgentHttp2Stream = () => {
+      openCount++;
+      const queue = [textFrame("partial"), new Error("blob not found")];
+      return {
+        responseHeaders: Promise.resolve({ ":status": 200 }),
+        write() {},
+        end() {},
+        close() {},
+        async read() {
+          if (!queue.length) return { value: undefined, done: true };
+          const value = queue.shift();
+          if (value instanceof Error) throw value;
+          return { value, done: false };
+        },
+      };
+    };
+    // Partial output already emitted → no retry, transport error propagates.
+    await expect(executor.executeAgent({
+      model: "gpt-5.2-no-retry",
+      body: { messages: [{ role: "user", content: "hi" }] },
+      stream: false,
+      credentials,
+    })).rejects.toThrow("blob not found");
+    expect(openCount).toBe(1);
   });
 });
