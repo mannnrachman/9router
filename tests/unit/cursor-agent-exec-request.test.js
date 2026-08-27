@@ -838,3 +838,140 @@ describe("Cursor AgentService thinking, blobs, checkpoint, retry (pi-cursor pari
     expect(openCount).toBe(1);
   });
 });
+
+describe("Cursor AgentService P0 transport parity", () => {
+  it("maps resource_exhausted to HTTP 429 via execute()", async () => {
+    vi.useFakeTimers();
+    const executor = new CursorExecutor();
+    executor.openAgentHttp2Stream = () => ({
+      responseHeaders: Promise.resolve({ ":status": 429 }),
+      write() {},
+      end() {},
+      close() {},
+      async read() {
+        return { value: Buffer.from("resource_exhausted"), done: true };
+      },
+    });
+    const resultPromise = executor.execute({
+      model: "gpt-5.2-rate",
+      body: { messages: [{ role: "user", content: "hi" }] },
+      stream: false,
+      credentials,
+    });
+    await vi.advanceTimersByTimeAsync(10000);
+    const result = await resultPromise;
+    expect(result.response.status).toBe(429);
+    const payload = await result.response.json();
+    expect(payload.error.type).toBe("rate_limit_error");
+    expect(payload.error.code).toBe("rate_limit_exceeded");
+  });
+
+  it("maps timeout to HTTP 504 via execute()", async () => {
+    vi.useFakeTimers();
+    const executor = new CursorExecutor();
+    executor.openAgentHttp2Stream = () => ({
+      responseHeaders: Promise.resolve({ ":status": 200 }),
+      write() {},
+      end() {},
+      close() {},
+      async read() {
+        throw new Error("timeout");
+      },
+    });
+    const resultPromise = executor.execute({
+      model: "gpt-5.2-timeout",
+      body: { messages: [{ role: "user", content: "hi" }] },
+      stream: false,
+      credentials,
+    });
+    await vi.runAllTimersAsync();
+    const result = await resultPromise;
+    expect(result.response.status).toBe(504);
+    const payload = await result.response.json();
+    expect(payload.error.code).toBe("gateway_timeout");
+  });
+
+  it("passes proxyOptions from execute() to executeAgent()", async () => {
+    const executor = new CursorExecutor();
+    let receivedProxy;
+    executor.executeAgent = async (opts) => {
+      receivedProxy = opts.proxyOptions;
+      return {
+        response: new Response(JSON.stringify({ id: "x", choices: [{ message: { content: "ok" } }] }), {
+          headers: { "Content-Type": "application/json" },
+        }),
+        url: "http://test",
+        headers: {},
+        transformedBody: opts.body,
+      };
+    };
+    await executor.execute({
+      model: "gpt-5.2-proxy",
+      body: { messages: [{ role: "user", content: "hi" }] },
+      stream: false,
+      credentials,
+      proxyOptions: { enabled: true, url: "http://proxy.test" },
+    });
+    expect(receivedProxy).toEqual({ enabled: true, url: "http://proxy.test" });
+  });
+
+  it("emits SSE keepalive comments before first output", async () => {
+    vi.useFakeTimers();
+    const executor = new CursorExecutor();
+    let readResolve;
+    executor.openAgentHttp2Stream = () => ({
+      responseHeaders: Promise.resolve({ ":status": 200 }),
+      write() {},
+      end() {},
+      close() {},
+      read() {
+        return new Promise((resolve) => {
+          readResolve = resolve;
+        });
+      },
+    });
+    const result = await executor.executeAgent({
+      model: "gpt-5.2-keepalive",
+      body: { messages: [{ role: "user", content: "hi" }] },
+      stream: true,
+      credentials,
+    });
+    const reader = result.response.body.getReader();
+    await vi.advanceTimersByTimeAsync(15000);
+    const { value: keepaliveChunk } = await reader.read();
+    expect(new TextDecoder().decode(keepaliveChunk)).toContain(": keepalive");
+    readResolve?.({ value: textFrame("late"), done: false });
+    await vi.advanceTimersByTimeAsync(0);
+    readResolve?.({ value: turnEndFrame(), done: false });
+    await vi.advanceTimersByTimeAsync(0);
+    readResolve?.({ value: undefined, done: true });
+    const { value: textChunk } = await reader.read();
+    expect(new TextDecoder().decode(textChunk)).toContain("late");
+  });
+
+  it("closes streaming with terminal SSE error instead of controller.error on transport failure", async () => {
+    vi.useFakeTimers();
+    const executor = new CursorExecutor();
+    executor.openAgentHttp2Stream = () => ({
+      responseHeaders: Promise.resolve({ ":status": 429 }),
+      write() {},
+      end() {},
+      close() {},
+      async read() {
+        return { value: Buffer.from("resource_exhausted"), done: true };
+      },
+    });
+    const resultPromise = executor.execute({
+      model: "gpt-5.2-stream-err",
+      body: { messages: [{ role: "user", content: "hi" }] },
+      stream: true,
+      credentials,
+    });
+    await vi.advanceTimersByTimeAsync(10000);
+    const result = await resultPromise;
+    const body = await result.response.text();
+    expect(body).toContain("rate_limit_error");
+    expect(body).toContain("[DONE]");
+    expect(body).not.toContain("controller.error");
+  });
+});

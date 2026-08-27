@@ -17,6 +17,7 @@ export default {
     baseUrl: "https://api2.cursor.sh",
     chatPath: "/aiserver.v1.ChatService/StreamUnifiedChatWithTools",
     format: "cursor",
+    stallTimeoutMs: Number(process.env.CURSOR_STALL_TIMEOUT_MS || 600000),
     headers: {
       "connect-accept-encoding": "gzip",
       "connect-protocol-version": "1",

@@ -306,6 +306,7 @@ const PROTOBUF_VARINT = 0;
 const CURSOR_AGENT_SESSION_TTL_MS = 5 * 60 * 1000;
 const CURSOR_AGENT_STREAM_TIMEOUT_MS = Number(process.env.CURSOR_STREAM_TIMEOUT_MS || 300000);
 const CURSOR_AGENT_HEARTBEAT_MS = Number(process.env.CURSOR_HEARTBEAT_MS || 5000);
+const CURSOR_SSE_KEEPALIVE_MS = Number(process.env.CURSOR_SSE_KEEPALIVE_MS || 15000);
 const CURSOR_AGENT_MAX_RETRIES = (() => {
   const value = Number(process.env.CURSOR_AGENT_MAX_RETRIES);
   return Number.isFinite(value) && value >= 0 ? Math.floor(value) : 2;
@@ -400,6 +401,7 @@ function retryDelayMs(hint) {
   switch (hint) {
     case "blob_not_found": base = 200; break;
     case "resource_exhausted": base = 2000; break;
+    case "timeout": base = 3000; break;
     default: base = 1000; break;
   }
   return Math.round(base * (1 + Math.random() * 0.5));
@@ -409,7 +411,34 @@ function classifyCursorError(message) {
   const text = String(message || "");
   if (/blob not found/i.test(text)) return "blob_not_found";
   if (/resource_exhausted/i.test(text)) return "resource_exhausted";
+  if (text === "timeout" || /stream timeout/i.test(text)) return "timeout";
   return null;
+}
+
+function mapCursorAgentErrorResponse(error) {
+  const hint = error?.retryHint || classifyCursorError(error?.message || "");
+  if (hint === "resource_exhausted") {
+    return {
+      status: HTTP_STATUS.RATE_LIMITED,
+      type: "rate_limit_error",
+      code: "rate_limit_exceeded",
+      message: error?.message || "resource_exhausted",
+    };
+  }
+  if (hint === "timeout") {
+    return {
+      status: HTTP_STATUS.GATEWAY_TIMEOUT,
+      type: "server_error",
+      code: "gateway_timeout",
+      message: error?.message || "timeout",
+    };
+  }
+  return {
+    status: HTTP_STATUS.SERVER_ERROR,
+    type: "connection_error",
+    code: "",
+    message: error?.message || "Cursor AgentService request failed",
+  };
 }
 
 function sleepMs(ms) {
@@ -1137,7 +1166,7 @@ export class CursorExecutor extends BaseExecutor {
     };
   }
 
-  async executeAgent({ model, body, stream, credentials, signal, log, modelCatalog }) {
+  async executeAgent({ model, body, stream, credentials, signal, log, modelCatalog, proxyOptions = null }) {
     const agentEndpoint = PROVIDER_OAUTH.cursor?.agentEndpoint;
     if (!agentEndpoint) throw new Error("Cursor AgentService endpoint is not configured");
 
@@ -1148,6 +1177,10 @@ export class CursorExecutor extends BaseExecutor {
     if (signal?.addEventListener) {
       if (signal.aborted) requestController.abort(signal.reason);
       else signal.addEventListener("abort", () => requestController.abort(signal.reason), { once: true });
+    }
+
+    if (proxyOptions?.enabled || proxyOptions?.connectionProxyEnabled || proxyOptions?.vercelRelayUrl) {
+      traceLog(runId, `proxyOptions pending http2 proxy wiring enabled=${Boolean(proxyOptions?.enabled)} conn=${Boolean(proxyOptions?.connectionProxyEnabled)}`);
     }
 
     const toolResults = extractCursorToolResults(body);
@@ -1256,8 +1289,8 @@ export class CursorExecutor extends BaseExecutor {
         try {
           while (true) {
             const { done, value } = await session.read();
+            if (value) errorText += Buffer.from(value).toString("utf8");
             if (done) break;
-            errorText += Buffer.from(value).toString("utf8");
           }
         } catch {}
         session.close();
@@ -1580,14 +1613,58 @@ export class CursorExecutor extends BaseExecutor {
     }
 
     const encoder = new TextEncoder();
+    const streamState = { clearKeepalive: null };
     const responseStream = new ReadableStream({
       start(controller) {
+        let keepaliveTimer;
+        let streamOutputStarted = false;
+        const clearKeepalive = () => {
+          if (keepaliveTimer) {
+            clearInterval(keepaliveTimer);
+            keepaliveTimer = null;
+          }
+        };
+        streamState.clearKeepalive = clearKeepalive;
+        const markStreamOutput = () => {
+          if (!streamOutputStarted) {
+            streamOutputStarted = true;
+            clearKeepalive();
+          }
+        };
+        const closeWithAgentError = (error) => {
+          clearKeepalive();
+          const mapped = mapCursorAgentErrorResponse(error);
+          try {
+            controller.enqueue(encoder.encode(sseChunk({
+              error: {
+                message: mapped.message,
+                type: mapped.type,
+                ...(mapped.code ? { code: mapped.code } : {}),
+              },
+            })));
+            controller.enqueue(encoder.encode(SSE_DONE));
+            controller.close();
+          } catch {}
+        };
+
+        keepaliveTimer = setInterval(() => {
+          if (!streamOutputStarted && !requestController.signal.aborted) {
+            try {
+              controller.enqueue(encoder.encode(": keepalive\n\n"));
+            } catch {}
+          }
+        }, CURSOR_SSE_KEEPALIVE_MS);
+        keepaliveTimer.unref?.();
+
         runWithRetry((event) => {
           if (event.type === "text") {
+            markStreamOutput();
             controller.enqueue(encoder.encode(chatChunkSse({ id: responseId, created, model, delta: { content: event.value } })));
           } else if (event.type === "thinking") {
+            markStreamOutput();
             controller.enqueue(encoder.encode(chatChunkSse({ id: responseId, created, model, delta: { reasoning_content: event.value } })));
           } else if (event.type === "tool_call") {
+            markStreamOutput();
             controller.enqueue(encoder.encode(chatChunkSse({
               id: responseId,
               created,
@@ -1595,23 +1672,27 @@ export class CursorExecutor extends BaseExecutor {
               delta: { tool_calls: [{ index: 0, ...event.value }] },
             })));
             controller.enqueue(encoder.encode(chatChunkSse({ id: responseId, created, model, delta: {}, finishReason: "tool_calls" })));
+            clearKeepalive();
             controller.enqueue(encoder.encode(SSE_DONE));
             controller.close();
           } else if (event.type === "error") {
             // An SSE error frame, not a content delta: a protocol failure must not
             // be rendered to the user as the assistant's reply, and downstream
             // usage tracking must not record the turn as a success.
+            clearKeepalive();
             controller.enqueue(encoder.encode(sseChunk({ error: { message: event.value, type: "api_error" } })));
             controller.enqueue(encoder.encode(SSE_DONE));
             controller.close();
           } else if (event.type === "done") {
+            clearKeepalive();
             controller.enqueue(encoder.encode(chatChunkSse({ id: responseId, created, model, delta: {}, finishReason: "stop" })));
             controller.enqueue(encoder.encode(SSE_DONE));
             controller.close();
           }
-        }).catch((error) => controller.error(error));
+        }).catch((error) => closeWithAgentError(error));
       },
       cancel() {
+        streamState.clearKeepalive?.();
         requestController.abort();
       },
     });
@@ -1628,12 +1709,17 @@ export class CursorExecutor extends BaseExecutor {
   async execute({ model, body, stream, credentials, signal, log, proxyOptions = null }) {
     if (isAgentTextRequest(body)) {
       try {
-        return await this.executeAgent({ model, body, stream, credentials, signal, log });
+        return await this.executeAgent({ model, body, stream, credentials, signal, log, proxyOptions });
       } catch (error) {
+        const mapped = mapCursorAgentErrorResponse(error);
         return {
           response: new Response(JSON.stringify({
-            error: { message: error.message, type: "connection_error", code: "" },
-          }), { status: HTTP_STATUS.SERVER_ERROR, headers: { "Content-Type": "application/json" } }),
+            error: {
+              message: mapped.message,
+              type: mapped.type,
+              ...(mapped.code ? { code: mapped.code } : {}),
+            },
+          }), { status: mapped.status, headers: { "Content-Type": "application/json" } }),
           url: `${PROVIDER_OAUTH.cursor?.agentEndpoint || ""}${AGENT_RUN_PATH}`,
           headers: {},
           transformedBody: body,
