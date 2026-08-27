@@ -7,10 +7,11 @@
  */
 
 import crypto from "crypto";
-import http2 from "http2";
 import { PROVIDER_OAUTH } from "../providers/index.js";
 import { buildCursorHeaders } from "../utils/cursorChecksum.js";
 import { decodeMessage, encodeField } from "../utils/cursorProtobuf.js";
+import { connectHttp2 } from "../utils/http2Connect.js";
+import { resolveOutboundProxyUrl } from "../utils/proxyFetch.js";
 
 const FETCH_TIMEOUT_MS = 10_000;
 const CACHE_TTL_MS = 5 * 60 * 1000;
@@ -56,10 +57,11 @@ function getCursorModelsUrl() {
   return `${config.apiEndpoint.replace(/\/$/, "")}${config.availableModelsEndpoint}`;
 }
 
-function cacheKey(credentials) {
+function cacheKey(credentials, proxyUrl = "") {
   const seed = [
     credentials?.providerSpecificData?.machineId,
     credentials?.accessToken,
+    proxyUrl || "direct",
   ].filter(Boolean).join(":");
   if (!seed) return "cursor-anonymous";
   return crypto.createHash("sha256").update(`cursor:${seed}`).digest("hex");
@@ -336,58 +338,73 @@ export function resolveCursorModelSelection(models, requestedModel) {
 /**
  * Cursor's unary model catalog is HTTP/2-only; Node fetch/undici cannot speak
  * h2. AvailableModels uses an unframed protobuf body (application/proto).
+ * Optional HTTP/SOCKS proxy is applied via CONNECT tunnel + ALPN h2.
  */
-function http2PostProto(url, headers, body, signal, timeoutMs) {
+function http2PostProto(url, headers, body, signal, timeoutMs, proxyOptions = null) {
   return new Promise((resolve, reject) => {
-    const urlObj = new URL(url);
-    const client = http2.connect(`https://${urlObj.host}`);
-    const chunks = [];
-    let responseHeaders = {};
+    const proxyUrl = resolveOutboundProxyUrl(url, proxyOptions);
     let settled = false;
+    let client = null;
+    let timeoutId = null;
 
     const finish = (fn) => (...args) => {
       if (settled) return;
       settled = true;
-      clearTimeout(timeoutId);
-      try { client.close(); } catch {}
+      if (timeoutId) clearTimeout(timeoutId);
+      try { client?.close(); } catch {}
       fn(...args);
     };
 
-    const timeoutId = setTimeout(finish(() => {
-      reject(new Error("Cursor AvailableModels timed out"));
-    }), timeoutMs);
+    const fail = finish(reject);
+    const succeed = finish(resolve);
 
-    client.on("error", finish(reject));
+    timeoutId = setTimeout(() => fail(new Error("Cursor AvailableModels timed out")), timeoutMs);
 
-    const req = client.request({
-      ":method": "POST",
-      ":path": `${urlObj.pathname}${urlObj.search}`,
-      ":authority": urlObj.host,
-      ":scheme": "https",
-      ...headers,
-    });
+    connectHttp2(url, { proxyUrl, timeoutMs })
+      .then((session) => {
+        if (settled) {
+          try { session.close(); } catch {}
+          return;
+        }
+        client = session;
+        client.on("error", fail);
 
-    req.on("response", (hdrs) => { responseHeaders = hdrs; });
-    req.on("data", (chunk) => { chunks.push(chunk); });
-    req.on("end", finish(() => {
-      resolve({
-        status: Number(responseHeaders[":status"] || 0),
-        body: Buffer.concat(chunks),
-      });
-    }));
-    req.on("error", finish(reject));
+        const urlObj = new URL(url);
+        const req = client.request({
+          ":method": "POST",
+          ":path": `${urlObj.pathname}${urlObj.search}`,
+          ":authority": urlObj.host,
+          ":scheme": "https",
+          ...headers,
+        });
 
-    if (signal) {
-      const onAbort = finish(() => reject(new Error("Request aborted")));
-      if (signal.aborted) onAbort();
-      else signal.addEventListener("abort", onAbort, { once: true });
-    }
+        const chunks = [];
+        let responseHeaders = {};
+        req.on("response", (hdrs) => { responseHeaders = hdrs; });
+        req.on("data", (chunk) => { chunks.push(chunk); });
+        req.on("end", () => {
+          succeed({
+            status: Number(responseHeaders[":status"] || 0),
+            body: Buffer.concat(chunks),
+          });
+        });
+        req.on("error", fail);
 
-    req.end(body && body.length ? Buffer.from(body) : undefined);
+        if (signal) {
+          const onAbort = () => fail(new Error("Request aborted"));
+          if (signal.aborted) onAbort();
+          else signal.addEventListener("abort", onAbort, { once: true });
+        }
+
+        req.end(body && body.length ? Buffer.from(body) : undefined);
+      })
+      .catch(fail);
   });
 }
 
-async function fetchCursorCatalog(credentials, signal, additionalModelNames = []) {
+async function fetchCursorCatalog(credentials, options = {}) {
+  const signal = options.signal;
+  const additionalModelNames = options.additionalModelNames || [];
   const accessToken = credentials?.accessToken;
   const machineId = credentials?.providerSpecificData?.machineId;
   const url = getCursorModelsUrl();
@@ -409,6 +426,7 @@ async function fetchCursorCatalog(credentials, signal, additionalModelNames = []
     encodeAvailableModelsRequest(additionalModelNames),
     signal,
     FETCH_TIMEOUT_MS,
+    options.proxyOptions,
   );
   if (response.status !== 200) {
     const error = new Error(`Cursor AvailableModels returned ${response.status}`);
@@ -429,7 +447,9 @@ export async function resolveCursorModels(credentials, options = {}) {
     return null;
   }
 
-  const key = cacheKey(credentials);
+  const catalogUrl = getCursorModelsUrl();
+  const proxyUrl = catalogUrl ? resolveOutboundProxyUrl(catalogUrl, options.proxyOptions) : "";
+  const key = cacheKey(credentials, proxyUrl);
   const now = Date.now();
   if (!options.forceRefresh) {
     const cached = catalogCache.get(key);
@@ -437,7 +457,7 @@ export async function resolveCursorModels(credentials, options = {}) {
   }
 
   try {
-    const models = await fetchCursorCatalog(credentials, options.signal, options.additionalModelNames);
+    const models = await fetchCursorCatalog(credentials, options);
     if (!models?.length) return null;
     catalogCache.set(key, { expiresAt: now + CACHE_TTL_MS, models });
     return { models };

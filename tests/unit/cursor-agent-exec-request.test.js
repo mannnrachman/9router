@@ -1,6 +1,6 @@
 import { afterEach, describe, it, expect, vi } from "vitest";
 
-import { CursorExecutor } from "../../open-sse/executors/cursor.js";
+import { CursorExecutor, resolveCursorAgentModel } from "../../open-sse/executors/cursor.js";
 import {
   decodeMessage,
   encodeAgentValue,
@@ -973,5 +973,47 @@ describe("Cursor AgentService P0 transport parity", () => {
     expect(body).toContain("rate_limit_error");
     expect(body).toContain("[DONE]");
     expect(body).not.toContain("controller.error");
+  });
+});
+
+describe("Cursor AgentService P1 proxy and Fable-fast mapping", () => {
+  it("maps claude-fable *-fast slugs to catalog ids", () => {
+    expect(resolveCursorAgentModel("claude-fable-5-thinking-max-fast")).toBe("claude-fable-5-thinking-max");
+    expect(resolveCursorAgentModel("claude-fable-5-max-fast")).toBe("claude-fable-5-max");
+    expect(resolveCursorAgentModel("claude-opus-5-thinking-max-fast")).toBe("claude-opus-5-thinking-max-fast");
+    expect(resolveCursorAgentModel("gpt-5.6-sol-max-fast")).toBe("gpt-5.6-sol-max-fast");
+  });
+
+  it("passes proxyOptions from execute() to openAgentHttp2Stream()", async () => {
+    const executor = new CursorExecutor();
+    let seenProxy;
+    const queue = [textFrame("ok"), turnEndFrame()];
+    executor.openAgentHttp2Stream = async (_url, _headers, _signal, proxyOptions) => {
+      seenProxy = proxyOptions;
+      return {
+        responseHeaders: Promise.resolve({ ":status": 200 }),
+        write() {},
+        end() {},
+        close() {},
+        async read() {
+          if (!queue.length) return { value: undefined, done: true };
+          return { value: queue.shift(), done: false };
+        },
+      };
+    };
+    await executor.execute({
+      model: "gpt-5.2-proxy-h2",
+      body: { messages: [{ role: "user", content: "hi" }] },
+      stream: false,
+      credentials,
+      proxyOptions: {
+        connectionProxyEnabled: true,
+        connectionProxyUrl: "http://127.0.0.1:10808",
+      },
+    });
+    expect(seenProxy).toEqual({
+      connectionProxyEnabled: true,
+      connectionProxyUrl: "http://127.0.0.1:10808",
+    });
   });
 });

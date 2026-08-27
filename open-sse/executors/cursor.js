@@ -35,7 +35,8 @@ import { estimateUsage } from "../utils/usageTracking.js";
 import { SSE_DONE, SSE_HEADERS } from "../utils/sseConstants.js";
 import { chatChunkSse, sseChunk } from "../utils/sse.js";
 import { FORMATS } from "../translator/formats.js";
-import { proxyAwareFetch } from "../utils/proxyFetch.js";
+import { proxyAwareFetch, resolveOutboundProxyUrl } from "../utils/proxyFetch.js";
+import { connectHttp2 } from "../utils/http2Connect.js";
 import { resolveCursorModel, resolveCursorModelSelection } from "../services/cursorModels.js";
 import zlib from "node:zlib";
 import { promises as fs } from "node:fs";
@@ -303,7 +304,10 @@ const AGENT_RUN_PATH = "/agent.v1.AgentService/Run";
 const PROTOBUF_LEN = 2;
 const PROTOBUF_VARINT = 0;
 
-const CURSOR_AGENT_SESSION_TTL_MS = 5 * 60 * 1000;
+const CURSOR_AGENT_SESSION_TTL_MS = (() => {
+  const value = Number(process.env.CURSOR_AGENT_SESSION_TTL_MS);
+  return Number.isFinite(value) && value > 0 ? Math.floor(value) : 5 * 60 * 1000;
+})();
 const CURSOR_AGENT_STREAM_TIMEOUT_MS = Number(process.env.CURSOR_STREAM_TIMEOUT_MS || 300000);
 const CURSOR_AGENT_HEARTBEAT_MS = Number(process.env.CURSOR_HEARTBEAT_MS || 5000);
 const CURSOR_SSE_KEEPALIVE_MS = Number(process.env.CURSOR_SSE_KEEPALIVE_MS || 15000);
@@ -653,6 +657,25 @@ export function isAgentCapableRequest(body) {
 }
 
 const isAgentTextRequest = isAgentCapableRequest;
+
+function maskCursorProxyUrl(proxyUrl) {
+  try {
+    const parsed = new URL(proxyUrl);
+    return `${parsed.protocol}//${parsed.hostname}${parsed.port ? `:${parsed.port}` : ""}`;
+  } catch {
+    return "proxy";
+  }
+}
+
+// Cursor's live catalog has no `claude-fable-*-fast` slugs. `-fast` is a real
+// speed tier for Opus/GPT/Grok; on Fable it yields HTTP 200 with an empty stream.
+export function resolveCursorAgentModel(model) {
+  if (typeof model !== "string") return model;
+  if (model.includes("claude-fable-") && model.endsWith("-fast")) {
+    return model.slice(0, -"-fast".length);
+  }
+  return model;
+}
 
 function toolCallsFromMessage(message) {
   if (!Array.isArray(message?.tool_calls) || message.tool_calls.length === 0) return "";
@@ -1072,13 +1095,21 @@ export class CursorExecutor extends BaseExecutor {
    * AgentService (agent.api5.cursor.sh) is HTTP/2-only. Node's fetch/undici speaks
    * HTTP/1.1 and fails with HTTPParserError on the h2 preface — use http2 duplex.
    */
-  openAgentHttp2Stream(url, headers, signal) {
+  async openAgentHttp2Stream(url, headers, signal, proxyOptions = null) {
     if (!http2) {
       throw new Error("HTTP/2 is required for Cursor AgentService (endpoint is h2-only)");
     }
 
     const urlObj = new URL(url);
-    const client = http2.connect(`https://${urlObj.host}`);
+    const proxyUrl = resolveOutboundProxyUrl(url, proxyOptions);
+    if (proxyOptions?.connectionProxyEnabled === true && !proxyUrl) {
+      throw new Error("Cursor AgentService proxy is bound but could not be resolved");
+    }
+    if (proxyUrl) {
+      console.info("CURSOR_AGENT", `Run via HTTP/2 proxy ${maskCursorProxyUrl(proxyUrl)}`);
+    }
+
+    const client = await connectHttp2(url, { proxyUrl });
     const chunkQueue = [];
     let waiting = null;
     let ended = false;
@@ -1180,7 +1211,7 @@ export class CursorExecutor extends BaseExecutor {
     }
 
     if (proxyOptions?.enabled || proxyOptions?.connectionProxyEnabled || proxyOptions?.vercelRelayUrl) {
-      traceLog(runId, `proxyOptions pending http2 proxy wiring enabled=${Boolean(proxyOptions?.enabled)} conn=${Boolean(proxyOptions?.connectionProxyEnabled)}`);
+      traceLog(runId, `proxyOptions enabled=${Boolean(proxyOptions?.enabled)} conn=${Boolean(proxyOptions?.connectionProxyEnabled)} relay=${Boolean(proxyOptions?.vercelRelayUrl)}`);
     }
 
     const toolResults = extractCursorToolResults(body);
@@ -1193,10 +1224,15 @@ export class CursorExecutor extends BaseExecutor {
     }
 
     const reasoningEffort = body.reasoning_effort || body.reasoning?.effort || null;
+    const agentModel = resolveCursorAgentModel(model);
+    if (agentModel !== model) {
+      debugLog(`[CURSOR AGENT ${runId}] resolved model ${model} → ${agentModel}`);
+    }
+
     const modelSelection = modelCatalog !== undefined
       ? resolveCursorModelSelection(modelCatalog, model)
       : shouldResolveCursorModel(model)
-        ? await resolveCursorModel(credentials, model, { signal: requestController.signal, log })
+        ? await resolveCursorModel(credentials, model, { signal: requestController.signal, log, proxyOptions })
         : null;
     if (modelSelection) {
       debugLog(
@@ -1221,7 +1257,7 @@ export class CursorExecutor extends BaseExecutor {
     // attempt so a blob_not_found reset (new conversation ID) is picked up.
     const buildRunFrame = () => buildAgentRunFrame(
       body.messages || [],
-      model,
+      agentModel,
       body.tools || [],
       modelSelection,
       reasoningEffort,
@@ -1256,7 +1292,7 @@ export class CursorExecutor extends BaseExecutor {
           );
           traceLog(runId, `resume=${JSON.stringify(retained.matchedResults)}`);
         } else {
-          session = this.openAgentHttp2Stream(url, headers, requestController.signal);
+          session = await this.openAgentHttp2Stream(url, headers, requestController.signal, proxyOptions);
           debugLog(
             `[CURSOR AGENT ${runId}] Run model=${model}, messages=${body.messages?.length || 0}, `
             + `roles=${(body.messages || []).map((message) => message?.role || "?").join(",")}, `
@@ -1706,10 +1742,10 @@ export class CursorExecutor extends BaseExecutor {
     };
   }
 
-  async execute({ model, body, stream, credentials, signal, log, proxyOptions = null }) {
+  async execute({ model, body, stream, credentials, signal, log, proxyOptions = null, modelCatalog }) {
     if (isAgentTextRequest(body)) {
       try {
-        return await this.executeAgent({ model, body, stream, credentials, signal, log, proxyOptions });
+        return await this.executeAgent({ model, body, stream, credentials, signal, log, proxyOptions, modelCatalog });
       } catch (error) {
         const mapped = mapCursorAgentErrorResponse(error);
         return {
