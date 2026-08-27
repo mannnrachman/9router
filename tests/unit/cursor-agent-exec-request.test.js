@@ -1,6 +1,6 @@
 import { afterEach, describe, it, expect, vi } from "vitest";
 
-import { CursorExecutor, resolveCursorAgentModel } from "../../open-sse/executors/cursor.js";
+import { CursorExecutor, resolveCursorAgentModel, splitMessagesIntoTurns, buildTurnsTranscript } from "../../open-sse/executors/cursor.js";
 import {
   decodeMessage,
   encodeAgentValue,
@@ -1015,5 +1015,29 @@ describe("Cursor AgentService P1 proxy and Fable-fast mapping", () => {
       connectionProxyEnabled: true,
       connectionProxyUrl: "http://127.0.0.1:10808",
     });
+  });
+});
+
+describe("Cursor AgentService P2 turn archive", () => {
+  it("splits OpenAI messages into user-led turns", () => {
+    const turns = splitMessagesIntoTurns([
+      { role: "user", content: "first" },
+      { role: "assistant", content: "ok" },
+      { role: "user", content: "second" },
+      { role: "assistant", content: "done" },
+    ]);
+    expect(turns).toHaveLength(2);
+    expect(turns[0].userText).toBe("first");
+    expect(turns[0].assistantTexts).toEqual(["ok"]);
+    expect(turns[1].userText).toBe("second");
+  });
+
+  it("builds a transcript for ConversationSummaryArchive", () => {
+    const transcript = buildTurnsTranscript([
+      { userText: "hello", assistantTexts: ["hi"], toolLines: [] },
+    ]);
+    expect(transcript).toContain("Earlier conversation");
+    expect(transcript).toContain("User: hello");
+    expect(transcript).toContain("Assistant: hi");
   });
 });

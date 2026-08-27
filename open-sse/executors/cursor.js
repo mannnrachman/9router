@@ -318,6 +318,10 @@ const CURSOR_AGENT_MAX_RETRIES = (() => {
 // Conversation persistence: blobs + checkpoints survive past the 5-min tool-call
 // session TTL, so a later turn can resume the same Cursor conversation (pi-cursor parity).
 const CURSOR_CONVERSATION_TTL_MS = 30 * 60 * 1000;
+const CURSOR_TURN_ARCHIVE_THRESHOLD = (() => {
+  const value = Number(process.env.CURSOR_TURN_ARCHIVE_THRESHOLD);
+  return Number.isFinite(value) && value > 0 ? Math.floor(value) : 20;
+})();
 const MAX_BLOBS_PER_OWNER = 128;
 const retainedAgentSessions = new Map();
 const retainedAgentToolCalls = new Map();
@@ -391,13 +395,187 @@ function commitConversationTurn(conv, userTexts) {
 }
 
 function pruneAgentBlobs(blobStore) {
-  const excess = blobStore.size - MAX_BLOBS_PER_OWNER;
+  let excess = blobStore.size - MAX_BLOBS_PER_OWNER;
   if (excess <= 0) return;
   for (const key of blobStore.keys()) {
     if (excess <= 0) break;
     blobStore.delete(key);
     excess--;
   }
+}
+
+function storeCursorBlob(data, blobStore) {
+  const bytes = Buffer.from(data);
+  const id = crypto.createHash("sha256").update(bytes).digest();
+  blobStore.set(id.toString("hex"), bytes);
+  return new Uint8Array(id);
+}
+
+function encodeConversationSummaryArchive({
+  summarizedMessages = [],
+  summary = "",
+  windowTail = 0,
+  summaryMessage = new Uint8Array(),
+}) {
+  const parts = summarizedMessages.map((id) => encodeField(1, PROTOBUF_LEN, Buffer.from(id)));
+  if (summary) parts.push(agentString(2, summary));
+  if (windowTail) parts.push(encodeField(3, PROTOBUF_VARINT, windowTail));
+  if (summaryMessage?.length) parts.push(encodeField(4, PROTOBUF_LEN, Buffer.from(summaryMessage)));
+  return concatBuffers(...parts);
+}
+
+function encodeConversationState({ turns = [], summaryArchives = [], clientName = "9router" } = {}) {
+  const parts = [];
+  for (const id of turns) parts.push(encodeField(8, PROTOBUF_LEN, Buffer.from(id)));
+  for (const id of summaryArchives) parts.push(encodeField(13, PROTOBUF_LEN, Buffer.from(id)));
+  if (clientName) parts.push(agentString(22, clientName));
+  return concatBuffers(...parts);
+}
+
+function getStateTurnBlobIds(state) {
+  return (state.get(8) || [])
+    .map((entry) => entry?.value)
+    .filter((value) => value instanceof Uint8Array || Buffer.isBuffer(value))
+    .map((value) => Buffer.from(value));
+}
+
+function getStateSummaryArchiveIds(state) {
+  return (state.get(13) || [])
+    .map((entry) => entry?.value)
+    .filter((value) => value instanceof Uint8Array || Buffer.isBuffer(value))
+    .map((value) => Buffer.from(value));
+}
+
+function extractTextFromTurnBlob(turnBlobId, blobStore) {
+  const turnData = blobStore.get(Buffer.from(turnBlobId).toString("hex"));
+  if (!turnData) return null;
+  const turnStruct = decodeMessage(turnData);
+  const agentTurnBytes = turnStruct.get(1)?.[0]?.value;
+  if (!agentTurnBytes) return null;
+  const agentTurn = decodeMessage(agentTurnBytes);
+  const userMsgId = agentTurn.get(1)?.[0]?.value;
+  if (!userMsgId) return null;
+  const userMsgData = blobStore.get(Buffer.from(userMsgId).toString("hex"));
+  if (!userMsgData) return null;
+  const userText = extractAgentString(decodeMessage(userMsgData), 1);
+  const lines = [];
+  if (userText) lines.push(`User: ${userText.slice(0, 1000)}`);
+  for (const stepEntry of agentTurn.get(2) || []) {
+    const stepData = blobStore.get(Buffer.from(stepEntry.value).toString("hex"));
+    if (!stepData) continue;
+    const step = decodeMessage(stepData);
+    const message = step.get(1)?.[0]?.value;
+    if (!message) continue;
+    const assistant = decodeMessage(message).get(1)?.[0]?.value;
+    if (!assistant) continue;
+    const text = extractAgentString(decodeMessage(assistant), 1);
+    if (text) lines.push(`Assistant: ${text.slice(0, 800)}`);
+  }
+  return lines.length ? lines.join("\n") : null;
+}
+
+function archiveCheckpointTurns(checkpointBytes, blobStore) {
+  if (!checkpointBytes?.length || !blobStore) return checkpointBytes;
+  const state = decodeMessage(checkpointBytes);
+  const turnIds = getStateTurnBlobIds(state);
+  if (turnIds.length <= CURSOR_TURN_ARCHIVE_THRESHOLD) return checkpointBytes;
+
+  const oldIds = turnIds.slice(0, turnIds.length - CURSOR_TURN_ARCHIVE_THRESHOLD);
+  const recentIds = turnIds.slice(-CURSOR_TURN_ARCHIVE_THRESHOLD);
+  const archiveLines = [`[Earlier conversation — ${oldIds.length} turn(s)]\n`];
+  for (let i = 0; i < oldIds.length; i++) {
+    const text = extractTextFromTurnBlob(oldIds[i], blobStore);
+    if (!text) return checkpointBytes;
+    archiveLines.push(`Turn ${i + 1}:\n${text}`);
+    archiveLines.push("");
+  }
+
+  const archiveBlobId = storeCursorBlob(
+    encodeConversationSummaryArchive({
+      summarizedMessages: oldIds,
+      summary: archiveLines.join("\n"),
+      windowTail: oldIds.length,
+    }),
+    blobStore,
+  );
+  pruneAgentBlobs(blobStore);
+
+  const parts = [];
+  for (const [field, entries] of state.entries()) {
+    if (field === 8 || field === 13 || field === 11) continue;
+    for (const entry of entries) {
+      if (entry.wireType === PROTOBUF_LEN) parts.push(encodeField(field, PROTOBUF_LEN, entry.value));
+      else if (entry.wireType === PROTOBUF_VARINT) parts.push(encodeField(field, PROTOBUF_VARINT, entry.value));
+    }
+  }
+  for (const id of recentIds) parts.push(encodeField(8, PROTOBUF_LEN, id));
+  for (const id of getStateSummaryArchiveIds(state)) parts.push(encodeField(13, PROTOBUF_LEN, id));
+  parts.push(encodeField(13, PROTOBUF_LEN, Buffer.from(archiveBlobId)));
+  return concatBuffers(...parts);
+}
+
+export function splitMessagesIntoTurns(messages) {
+  const turns = [];
+  let current = null;
+  for (const message of messages || []) {
+    if (message?.role === "user") {
+      if (current) turns.push(current);
+      current = { userText: textFromContent(message?.content), assistantTexts: [], toolLines: [] };
+    } else if (current) {
+      if (message?.role === "assistant") {
+        const text = textFromContent(message?.content);
+        if (text) current.assistantTexts.push(text);
+        const toolCalls = toolCallsFromMessage(message);
+        if (toolCalls) current.toolLines.push(toolCalls);
+        const toolResults = toolResultsFromMessage(message);
+        if (toolResults) current.toolLines.push(toolResults);
+      } else if (message?.role === "tool") {
+        const raw = textFromContent(message?.content);
+        current.toolLines.push(
+          `[Tool result ${message.tool_call_id || ""}${message.name ? ` (${message.name})` : ""}]\n${capCursorToolResult(raw)}`,
+        );
+      }
+    }
+  }
+  if (current) turns.push(current);
+  return turns;
+}
+
+export function buildTurnsTranscript(turns) {
+  const parts = [`[Earlier conversation — ${turns.length} turn(s)]\n`];
+  for (let i = 0; i < turns.length; i++) {
+    const turn = turns[i];
+    parts.push(`Turn ${i + 1}:`);
+    if (turn.userText) parts.push(`User: ${turn.userText.slice(0, 1000)}`);
+    for (const text of turn.assistantTexts) parts.push(`Assistant: ${text.slice(0, 800)}`);
+    for (const line of turn.toolLines) parts.push(line.slice(0, 400));
+    parts.push("");
+  }
+  return parts.join("\n");
+}
+
+function encodeAssistantStepBytes(text) {
+  const assistantMessage = agentString(1, text);
+  const message = agentMessage(1, assistantMessage);
+  return agentMessage(1, message);
+}
+
+function encodeTurnBlobFromParsedTurn(turn, blobStore) {
+  const userMsg = concatBuffers(
+    agentString(1, turn.userText || ""),
+    agentString(2, crypto.randomUUID()),
+  );
+  const userMsgId = storeCursorBlob(userMsg, blobStore);
+  const stepIds = turn.assistantTexts.map((text) =>
+    storeCursorBlob(encodeAssistantStepBytes(text), blobStore),
+  );
+  const agentTurn = concatBuffers(
+    agentMessage(1, userMsgId),
+    ...stepIds.map((id) => agentMessage(2, id)),
+    agentString(3, crypto.randomUUID()),
+  );
+  const turnStruct = agentMessage(1, agentTurn);
+  return storeCursorBlob(turnStruct, blobStore);
 }
 
 function retryDelayMs(hint) {
@@ -715,11 +893,12 @@ function encodeHistoryMessage(message) {
 }
 
 export function buildAgentRunFrame(messages, model, tools = [], modelSelection = null, reasoningEffort = null, resume = null) {
-  // resume = { conversationId, checkpoint } — continue a stored Cursor conversation
+  // resume = { conversationId, checkpoint, blobStore } — continue stored state
   // instead of replaying the whole history as fresh context.
-  const checkpoint = resume?.checkpoint || null;
+  const blobStore = resume?.blobStore || null;
+  let conversationState = resume?.checkpoint || null;
   const conversationId = resume?.conversationId || null;
-  if (!checkpoint) messages = compactCursorMessages(messages, model, tools);
+  if (!conversationState) messages = compactCursorMessages(messages, model, tools);
   const system = messages
     .filter((message) => message?.role === "system")
     .map((message) => textFromContent(message.content))
@@ -728,13 +907,36 @@ export function buildAgentRunFrame(messages, model, tools = [], modelSelection =
   const chatMessages = messages.filter((message) => message?.role !== "system");
   const currentIndex = [...chatMessages].map((message) => message?.role).findLastIndex((role) => role === "user" || role === "tool");
   const current = currentIndex >= 0 ? chatMessages[currentIndex] : chatMessages.at(-1);
-  // With a checkpoint the conversation state already holds prior turns; send only
-  // the current user message so Cursor resumes instead of replaying history.
-  const history = !checkpoint
-    ? chatMessages
-      .slice(0, currentIndex >= 0 ? currentIndex : -1)
-      .map(encodeHistoryMessage)
-      .filter(Boolean)
+  const priorMessages = chatMessages.slice(0, currentIndex >= 0 ? currentIndex : -1);
+
+  if (conversationState && blobStore) {
+    conversationState = archiveCheckpointTurns(conversationState, blobStore);
+  } else if (!conversationState && blobStore && priorMessages.length > 0) {
+    const turns = splitMessagesIntoTurns(priorMessages);
+    if (turns.length > CURSOR_TURN_ARCHIVE_THRESHOLD) {
+      const older = turns.slice(0, turns.length - CURSOR_TURN_ARCHIVE_THRESHOLD);
+      const recent = turns.slice(-CURSOR_TURN_ARCHIVE_THRESHOLD);
+      const archiveBlobId = storeCursorBlob(
+        encodeConversationSummaryArchive({
+          summarizedMessages: [],
+          summary: buildTurnsTranscript(older),
+          windowTail: older.length,
+        }),
+        blobStore,
+      );
+      const turnBlobIds = recent.map((turn) => encodeTurnBlobFromParsedTurn(turn, blobStore));
+      pruneAgentBlobs(blobStore);
+      conversationState = encodeConversationState({
+        turns: turnBlobIds,
+        summaryArchives: [archiveBlobId],
+      });
+    }
+  }
+
+  // With conversation_state the server resumes from blobs; only replay inline
+  // history when we have no serialized state yet.
+  const history = !conversationState
+    ? priorMessages.map(encodeHistoryMessage).filter(Boolean)
     : [];
   const rawCurrentText = textFromContent(current?.content);
   const currentText = current?.role === "tool"
@@ -758,7 +960,7 @@ export function buildAgentRunFrame(messages, model, tools = [], modelSelection =
   const requestedModel = encodeRequestedAgentModel(model, modelSelection, reasoningEffort);
   const runRequest = concatBuffers(
     // An empty ConversationStateStructure starts a fresh local agent session.
-    agentMessage(1, checkpoint || new Uint8Array()),
+    agentMessage(1, conversationState || new Uint8Array()),
     agentMessage(2, conversationAction),
     ...(tools.length ? [agentMessage(4, encodeMcpTools(tools))] : []),
     ...(conversationId ? [agentString(5, conversationId)] : []),
@@ -1261,7 +1463,7 @@ export class CursorExecutor extends BaseExecutor {
       body.tools || [],
       modelSelection,
       reasoningEffort,
-      conv.conversationId ? { conversationId: conv.conversationId, checkpoint: conv.checkpoint } : null,
+      conv.conversationId ? { conversationId: conv.conversationId, checkpoint: conv.checkpoint, blobStore: conv.blobStore } : null,
     );
 
     // One full attempt: (re)open the session, write the run frame, consume.
