@@ -541,7 +541,11 @@ describe("CursorExecutor AgentService exec_request handling", () => {
   it("expires retained sessions after five minutes", async () => {
     vi.useFakeTimers();
     const executor = new CursorExecutor();
-    const session = stubRetainedAgentSession(executor, [mcpExecFrame({ callId: "call_ttl" })]);
+    const session = stubRetainedAgentSession(executor, [
+      mcpExecFrame({ callId: "call_ttl" }),
+      textFrame("done"),
+      turnEndFrame(),
+    ]);
 
     const initial = await executor.executeAgent({
       model: "gpt-5.2",
@@ -768,6 +772,100 @@ describe("Cursor AgentService thinking, blobs, checkpoint, retry (pi-cursor pari
     // brand-new conversation_id (reset), distinct from the pre-reset one.
     expect(runRequest.get(1)?.[0]?.value.length ?? 0).toBe(0);
     expect(runRequest.get(5)?.[0]?.value.length ?? 0).toBeGreaterThan(0);
+  });
+
+  it("retries empty_turn by resetting a stale checkpoint and replaying history", async () => {
+    vi.useFakeTimers();
+    const executor = new CursorExecutor();
+    const checkpointBytes = Buffer.from([0x0a, 0x02, 0x68, 0x69]);
+    // Turn 1: establish checkpoint + real answer.
+    stubAgentSession(executor, [checkpointFrame(checkpointBytes), textFrame("first"), turnEndFrame()]);
+    await executor.executeAgent({
+      model: "gpt-5.2-empty-turn",
+      body: { messages: [{ role: "user", content: "hi" }] },
+      stream: false,
+      credentials,
+    });
+
+    // Turn 2: resume with checkpoint but server returns empty done (stale/duplicate).
+    // Then after reset, a fresh session must produce content.
+    let opens = 0;
+    const written = [];
+    executor.openAgentHttp2Stream = async () => {
+      opens += 1;
+      const queue = opens === 1
+        ? [turnEndFrame()] // empty terminal
+        : [textFrame("recovered"), turnEndFrame()];
+      return {
+        responseHeaders: Promise.resolve({ ":status": 200 }),
+        write: (frame) => written.push(Buffer.from(frame)),
+        end() {},
+        close() {},
+        async read() {
+          if (!queue.length) return { value: undefined, done: true };
+          return { value: queue.shift(), done: false };
+        },
+      };
+    };
+
+    const resultPromise = executor.executeAgent({
+      model: "gpt-5.2-empty-turn",
+      body: {
+        messages: [
+          { role: "user", content: "hi" },
+          { role: "assistant", content: "first" },
+          { role: "user", content: "again" },
+        ],
+      },
+      stream: false,
+      credentials,
+    });
+    await vi.advanceTimersByTimeAsync(5000);
+    const result = await resultPromise;
+    expect(result.response.status).toBe(200);
+    const payload = await result.response.json();
+    expect(payload.choices[0].message.content).toBe("recovered");
+    expect(opens).toBeGreaterThanOrEqual(2);
+  });
+
+  it("retries empty_turn on long message history even without a stored checkpoint", async () => {
+    vi.useFakeTimers();
+    const executor = new CursorExecutor();
+    const longHistory = Array.from({ length: 90 }, (_, i) => ([
+      { role: "user", content: `question ${i}` },
+      { role: "assistant", content: `answer ${i}` },
+    ])).flat();
+    longHistory.push({ role: "user", content: "continue" });
+
+    let opens = 0;
+    executor.openAgentHttp2Stream = async () => {
+      opens += 1;
+      const queue = opens === 1
+        ? [turnEndFrame()]
+        : [textFrame("recovered-long"), turnEndFrame()];
+      return {
+        responseHeaders: Promise.resolve({ ":status": 200 }),
+        write() {},
+        end() {},
+        close() {},
+        async read() {
+          if (!queue.length) return { value: undefined, done: true };
+          return { value: queue.shift(), done: false };
+        },
+      };
+    };
+
+    const resultPromise = executor.executeAgent({
+      model: "gpt-5.2-long-empty",
+      body: { messages: longHistory },
+      stream: false,
+      credentials,
+    });
+    await vi.advanceTimersByTimeAsync(5000);
+    const result = await resultPromise;
+    expect(opens).toBeGreaterThanOrEqual(2);
+    const payload = await result.response.json();
+    expect(payload.choices[0].message.content).toBe("recovered-long");
   });
 
   it("retries blob_not_found with a fresh session and resets the conversation", async () => {
