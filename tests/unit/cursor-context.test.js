@@ -1,4 +1,5 @@
 import { describe, it, expect } from "vitest";
+import { tailOnlyCursorMessages } from "../../open-sse/executors/cursor.js";
 import {
   inferContextWindow,
   scaleCursorUsageTokens,
@@ -42,5 +43,19 @@ describe("cursorContext infer + scale", () => {
     expect(usage.total_tokens).toBe(Math.round(197_000 * 1_048_576 / 200_000));
     expect(usage.completion_tokens).toBe(100);
     expect(usage.prompt_tokens).toBe(usage.total_tokens - 100);
+  });
+});
+
+describe("tailOnlyCursorMessages", () => {
+  it("keeps only the latest turn from a long history", () => {
+    const long = Array.from({ length: 100 }, (_, i) => ([
+      { role: "user", content: `u${i}` },
+      { role: "assistant", content: `a${i}` },
+    ])).flat();
+    long.push({ role: "user", content: "latest" });
+    const trimmed = tailOnlyCursorMessages(long);
+    expect(trimmed.length).toBeLessThanOrEqual(4);
+    expect(trimmed.some((m) => m.content === "latest")).toBe(true);
+    expect(trimmed.some((m) => String(m.content).includes("[9router]"))).toBe(true);
   });
 });

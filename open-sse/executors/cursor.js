@@ -178,6 +178,29 @@ function hardTrimCursorMessages(messages, keepCount = CURSOR_HARD_KEEP_MESSAGES)
   return [...systemMessages, note, ...suffix];
 }
 
+/** Minimal tail for wedged long sessions — drops bulk history and tool XML. */
+export function tailOnlyCursorMessages(messages) {
+  if (!Array.isArray(messages) || messages.length === 0) return messages || [];
+  const systemMessages = messages.filter(
+    (message) => message?.role === "system" && !String(message?.content || "").includes("[9router]"),
+  );
+  const chatMessages = messages.filter((message) => message?.role !== "system");
+  let anchor = chatMessages.length - 1;
+  for (let i = chatMessages.length - 1; i >= 0; i--) {
+    if (chatMessages[i]?.role === "user" || chatMessages[i]?.role === "tool") {
+      anchor = i;
+      break;
+    }
+  }
+  const tailStart = anchor > 0 && chatMessages[anchor - 1]?.role === "assistant" ? anchor - 1 : anchor;
+  const tail = chatMessages.slice(Math.max(0, tailStart));
+  const note = {
+    role: "system",
+    content: `[9router] Long session: ${messages.length} messages trimmed to the latest turn. Answer the current request; re-read files if needed.`,
+  };
+  return [...systemMessages, note, ...tail];
+}
+
 /** Escalating compaction for long Cursor agent sessions (levels 0–2). */
 export function prepareLongSessionMessages(messages, model, tools = [], { level = 0 } = {}) {
   const window = getCursorContextWindow(model);
@@ -1094,7 +1117,7 @@ function encodeHistoryMessage(message) {
   return agentMessage(1, agentMessage(1, agentMessage(1, text)));
 }
 
-export function buildAgentRunFrame(messages, model, tools = [], modelSelection = null, reasoningEffort = null, resume = null) {
+export function buildAgentRunFrame(messages, model, tools = [], modelSelection = null, reasoningEffort = null, resume = null, { omitTools = false } = {}) {
   // resume = { conversationId, checkpoint, blobStore } — continue stored state
   // instead of replaying the whole history as fresh context.
   const blobStore = resume?.blobStore || null;
@@ -1178,7 +1201,7 @@ export function buildAgentRunFrame(messages, model, tools = [], modelSelection =
     // An empty ConversationStateStructure starts a fresh local agent session.
     agentMessage(1, conversationState || new Uint8Array()),
     agentMessage(2, conversationAction),
-    ...(tools.length ? [agentMessage(4, encodeMcpTools(tools))] : []),
+    ...(omitTools || !tools.length ? [] : [agentMessage(4, encodeMcpTools(tools))]),
     ...(conversationId ? [agentString(5, conversationId)] : []),
     ...(system ? [agentString(8, system)] : []),
     agentMessage(9, requestedModel),
@@ -1678,28 +1701,36 @@ export class CursorExecutor extends BaseExecutor {
     const originalMessages = body.messages || [];
     const agentTools = body.tools || [];
     let compactLevel = 0;
+    let omitRunTools = false;
+    let workingMessages;
     if (originalMessages.length >= CURSOR_MSG_COMPACT_THRESHOLD) {
       compactLevel = 2;
+      omitRunTools = true;
       resetAgentConversation(conv);
-      traceLog(runId, `long_session force reset msgs=${originalMessages.length}`);
+      workingMessages = tailOnlyCursorMessages(originalMessages);
+      console.log(`[CURSOR AGENT ${runId}] long_session tail-only ${originalMessages.length}→${workingMessages.length} tools_omitted=${agentTools.length}`);
     } else if ((conv.emptyStreak || 0) >= 2) {
       const streak = conv.emptyStreak;
       compactLevel = 2;
+      omitRunTools = true;
       resetAgentConversation(conv);
-      traceLog(runId, `long_session hard trim emptyStreak=${streak}`);
+      workingMessages = tailOnlyCursorMessages(originalMessages);
+      console.log(`[CURSOR AGENT ${runId}] long_session hard trim emptyStreak=${streak}`);
     } else if (shouldDropAgentCheckpoint(originalMessages, agentModel, agentTools, conv)) {
       resetAgentConversation(conv);
       compactLevel = 1;
       traceLog(runId, `long_session drop checkpoint msgs=${originalMessages.length}`);
+      workingMessages = prepareLongSessionMessages(originalMessages, agentModel, agentTools, { level: compactLevel });
+    } else {
+      workingMessages = prepareLongSessionMessages(originalMessages, agentModel, agentTools, { level: compactLevel });
     }
-    let workingMessages = prepareLongSessionMessages(originalMessages, agentModel, agentTools, { level: compactLevel });
 
     // Build the run frame against the current conversation state. Rebuilt per
     // attempt so a blob_not_found reset (new conversation ID) is picked up.
     const buildRunFrame = () => buildAgentRunFrame(
       workingMessages,
       agentModel,
-      agentTools,
+      omitRunTools ? [] : agentTools,
       modelSelection,
       reasoningEffort,
       conv.conversationId
@@ -2050,7 +2081,7 @@ export class CursorExecutor extends BaseExecutor {
           // Stale checkpoint or oversized replay often yields HTTP 200 with no
           // deltas — treat as retryable instead of a fake successful empty stop.
           if (shouldRetryEmptyTurn(result, conv, originalMessages.length)) {
-            debugLog(`[CURSOR AGENT ${runId}] empty_turn attempt=${attempt + 1} msgs=${originalMessages.length} sawContent=${result.sawContent} keepOpen=${result.keepSessionOpen}`);
+            console.log(`[CURSOR AGENT ${runId}] empty_turn attempt=${attempt + 1}/${CURSOR_EMPTY_TURN_MAX_RETRIES} msgs=${originalMessages.length} working=${workingMessages.length} sawContent=${result.sawContent}`);
             const err = new Error("empty_turn");
             err.retryHint = "empty_turn";
             throw err;
@@ -2077,7 +2108,8 @@ export class CursorExecutor extends BaseExecutor {
             if (hint === "empty_turn") {
               conv.emptyStreak = (conv.emptyStreak || 0) + 1;
               compactLevel = Math.min(compactLevel + 1, 2);
-              workingMessages = prepareLongSessionMessages(originalMessages, agentModel, agentTools, { level: compactLevel });
+              omitRunTools = true;
+              workingMessages = tailOnlyCursorMessages(originalMessages);
             }
           }
           traceLog(runId, `retry ${attempt}/${maxRetries} hint=${hint}`);
@@ -2249,7 +2281,12 @@ export class CursorExecutor extends BaseExecutor {
             controller.close();
           }
         }).then((result) => {
-          if (result?.keepSessionOpen) return;
+          if (result?.keepSessionOpen) {
+            if (!streamHadContent) {
+              closeWithAgentError(Object.assign(new Error("context_exhausted"), { retryHint: "context_exhausted" }));
+            }
+            return;
+          }
           if (streamHadContent) finishStream();
           else closeWithAgentError(Object.assign(new Error("context_exhausted"), { retryHint: "context_exhausted" }));
         }).catch((error) => closeWithAgentError(error));
