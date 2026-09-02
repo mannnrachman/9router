@@ -834,6 +834,14 @@ function mapCursorAgentErrorResponse(error) {
       message: error?.message || "Cursor session context too large; start a new chat or run /compact in the IDE",
     };
   }
+  if (hint === "cursor_model_unresolved") {
+    return {
+      status: HTTP_STATUS.BAD_REQUEST,
+      type: "api_error",
+      code: "model_unresolved",
+      message: error?.message || "Could not resolve cursor/auto to a catalog model; refresh Cursor credentials",
+    };
+  }
   return {
     status: HTTP_STATUS.SERVER_ERROR,
     type: "connection_error",
@@ -901,6 +909,10 @@ function shouldResolveCursorModel(model) {
     || /(?:^|-)thinking(?:-|$)/i.test(model)
     || /\[[^\]]+=/.test(model)
   );
+}
+
+function requiresStrictCatalogResolution(model) {
+  return model === "auto" || model === "default";
 }
 
 function decodeXmlEntities(value) {
@@ -1117,6 +1129,14 @@ function encodeHistoryMessage(message) {
   return agentMessage(1, agentMessage(1, agentMessage(1, text)));
 }
 
+/** AgentService field 8 (custom_system_prompt) yields empty turns in headless proxy mode — fold into user text. */
+export function foldSystemIntoUserMessage(system, userText) {
+  const body = String(userText || "").trim();
+  const prefix = String(system || "").trim();
+  if (prefix && body) return `${prefix}\n\n${body}`;
+  return prefix || body || "Continue.";
+}
+
 export function buildAgentRunFrame(messages, model, tools = [], modelSelection = null, reasoningEffort = null, resume = null, { omitTools = false } = {}) {
   // resume = { conversationId, checkpoint, blobStore } — continue stored state
   // instead of replaying the whole history as fresh context.
@@ -1181,7 +1201,7 @@ export function buildAgentRunFrame(messages, model, tools = [], modelSelection =
   const currentText = current?.role === "tool"
     ? [`[Tool result ${current.tool_call_id || ""}${current.name ? ` (${current.name})` : ""}]`, capCursorToolResult(rawCurrentText)].filter(Boolean).join("\n")
     : capCursorToolXml(rawCurrentText);
-  const userText = currentText || "Continue.";
+  const userText = foldSystemIntoUserMessage(system, currentText);
 
   // agent.v1.UserMessageAction.user_message and its optional history.
   const userMessage = concatBuffers(
@@ -1203,7 +1223,6 @@ export function buildAgentRunFrame(messages, model, tools = [], modelSelection =
     agentMessage(2, conversationAction),
     ...(omitTools || !tools.length ? [] : [agentMessage(4, encodeMcpTools(tools))]),
     ...(conversationId ? [agentString(5, conversationId)] : []),
-    ...(system ? [agentString(8, system)] : []),
     agentMessage(9, requestedModel),
   );
 
@@ -1685,6 +1704,16 @@ export class CursorExecutor extends BaseExecutor {
         + `matchedBy=${modelSelection.matchedBy}, params=${modelSelection.parameters?.length || 0}`,
       );
     }
+    if (requiresStrictCatalogResolution(agentModel) && !modelSelection?.modelId) {
+      console.log(`[CURSOR AGENT ${runId}] model unresolved requested=${model} agentModel=${agentModel}`);
+      const err = new Error("cursor_model_unresolved");
+      err.retryHint = "cursor_model_unresolved";
+      throw err;
+    }
+    console.log(
+      `[CURSOR AGENT ${runId}] model=${modelSelection?.modelId || agentModel}`
+      + `${modelSelection?.matchedBy ? ` matchedBy=${modelSelection.matchedBy}` : ""}`,
+    );
 
     // Cursor's AgentService streams thinking deltas for OpenAI-format clients.
     // Claude Code (Anthropic) requires cryptographically signed thinking blocks,

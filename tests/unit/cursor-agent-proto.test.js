@@ -18,6 +18,7 @@ import {
   capCursorToolResult,
   compactCursorMessages,
   estimateCursorContextTokens,
+  foldSystemIntoUserMessage,
 } from "../../open-sse/executors/cursor.js";
 import {
   decodeExecServerEvent,
@@ -416,7 +417,7 @@ describe("Cursor AgentService executor helpers (cursor.js)", () => {
     // buildAgentRunFrame returns a wrapped Connect-RPC frame (5-byte header + AgentClientMessage).
     const unwrap = (frame) => frame.subarray(5);
 
-    it("encodes a text-only run request with system + model", () => {
+    it("folds system prompt into user message and omits field 8", () => {
       const frame = unwrap(buildAgentRunFrame(
         [{ role: "system", content: "be brief" }, { role: "user", content: "hi" }],
         "gpt-5.2",
@@ -425,7 +426,14 @@ describe("Cursor AgentService executor helpers (cursor.js)", () => {
       expect(clientMsg.has(1)).toBe(true); // run_request
       const run = decodeMessage(clientMsg.get(1)[0].value);
       expect(run.has(2)).toBe(true); // action
+      expect(run.has(8)).toBe(false); // custom_system_prompt must stay unset
       expect(run.has(9)).toBe(true); // requested_model
+      const action = decodeMessage(run.get(2)[0].value);
+      const userAction = decodeMessage(action.get(1)[0].value);
+      const userMsg = decodeMessage(userAction.get(1)[0].value);
+      const text = Buffer.from(userMsg.get(1)[0].value).toString("utf8");
+      expect(text).toContain("be brief");
+      expect(text).toContain("hi");
     });
 
     it("encodes a canonical model and catalog-selected parameters", () => {
@@ -502,6 +510,16 @@ describe("Cursor AgentService executor helpers (cursor.js)", () => {
       const history = decodeMessage(userAction.get(7)[0].value);
       expect(history.get(1).length).toBeGreaterThanOrEqual(2); // prior turns
     });
+  });
+});
+
+describe("foldSystemIntoUserMessage", () => {
+  it("joins system prefix and user body", () => {
+    expect(foldSystemIntoUserMessage("sys", "hello")).toBe("sys\n\nhello");
+  });
+
+  it("defaults when both are empty", () => {
+    expect(foldSystemIntoUserMessage("", "")).toBe("Continue.");
   });
 });
 
