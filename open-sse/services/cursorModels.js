@@ -12,6 +12,7 @@ import { buildCursorHeaders } from "../utils/cursorChecksum.js";
 import { decodeMessage, encodeField } from "../utils/cursorProtobuf.js";
 import { connectHttp2 } from "../utils/http2Connect.js";
 import { resolveOutboundProxyUrl } from "../utils/proxyFetch.js";
+import { inferContextWindow } from "./cursorContext.js";
 
 const FETCH_TIMEOUT_MS = 10_000;
 const CACHE_TTL_MS = 5 * 60 * 1000;
@@ -188,6 +189,7 @@ export function parseCursorAvailableModels(payload) {
       || id
     ).trim();
 
+    const window = inferContextWindow(id);
     models.push({
       id,
       name: clientDisplayName,
@@ -199,6 +201,9 @@ export function parseCursorAvailableModels(payload) {
       legacySlugs,
       idAliases,
       variants,
+      context_length: window,
+      contextWindow: window,
+      capabilities: { tools: true, contextWindow: window },
     });
   }
 
@@ -247,6 +252,8 @@ export function expandCursorModelAliases(models) {
         canonicalModelId: model.id,
         parameters: variant.parameters,
         isVariantAlias: true,
+        context_length: model.context_length || inferContextWindow(alias),
+        contextWindow: model.contextWindow || inferContextWindow(alias),
       });
     }
     for (const alias of [...(model.legacySlugs || []), ...(model.idAliases || [])]) {
@@ -257,6 +264,8 @@ export function expandCursorModelAliases(models) {
         canonicalModelId: model.id,
         parameters: [],
         isVariantAlias: true,
+        context_length: model.context_length || inferContextWindow(alias),
+        contextWindow: model.contextWindow || inferContextWindow(alias),
       });
     }
   }

@@ -210,8 +210,8 @@ describe("CursorExecutor AgentService exec_request handling", () => {
       stream: true,
     });
 
-    expect(written.length).toBe(2); // run frame + request-context reply
     const events = parseSSE(await result.response.text());
+    expect(written.length).toBe(2); // run frame + request-context reply
     const content = events.map((e) => e.choices?.[0]?.delta?.content || "").join("");
     expect(content).toBe("hello");
   });
@@ -1039,5 +1039,120 @@ describe("Cursor AgentService P2 turn archive", () => {
     expect(transcript).toContain("Earlier conversation");
     expect(transcript).toContain("User: hello");
     expect(transcript).toContain("Assistant: hi");
+  });
+});
+
+describe("Cursor AgentService P3 usage scaling + compact lineage", () => {
+  function tokenDetailsCheckpoint(used, max) {
+    const details = Buffer.concat([
+      Buffer.from(encodeField(1, VARINT, used)),
+      Buffer.from(encodeField(2, VARINT, max)),
+    ]);
+    return Buffer.from(encodeField(5, LEN, details));
+  }
+
+  it("scales usage when Cursor max window is tighter than inferred model window", async () => {
+    const { result } = await runAgent({
+      frames: [
+        checkpointFrame(tokenDetailsCheckpoint(197_000, 200_000)),
+        textFrame("ok"),
+        turnEndFrame(),
+      ],
+      stream: false,
+      model: "gemini-2.5-pro-scale",
+    });
+    const payload = await result.response.json();
+    // inferred gemini=1_048_576 → round(197000 * 1048576 / 200000) = 1033344
+    expect(payload.usage.total_tokens).toBe(Math.round(197_000 * 1_048_576 / 200_000));
+    expect(payload.usage.prompt_tokens).toBeGreaterThan(0);
+  });
+
+  it("emits usage on the final streaming chunk", async () => {
+    const { result } = await runAgent({
+      frames: [
+        checkpointFrame(tokenDetailsCheckpoint(50_000, 200_000)),
+        textFrame("streamed"),
+        turnEndFrame(),
+      ],
+      stream: true,
+      model: "gpt-5.2-usage-stream",
+    });
+    const events = parseSSE(await result.response.text());
+    const finish = events.find((e) => e.choices?.[0]?.finish_reason === "stop");
+    expect(finish?.usage?.total_tokens).toBeGreaterThan(0);
+    expect(finish.usage.prompt_tokens + finish.usage.completion_tokens).toBe(finish.usage.total_tokens);
+  });
+
+  it("keeps checkpoint when client shortens history after multi-turn compact", async () => {
+    const executor = new CursorExecutor();
+    const ckpt = Buffer.from([0x0a, 0x02, 0x6f, 0x6b]);
+    const model = "gpt-5.2-p3-compact-keep";
+
+    stubAgentSession(executor, [checkpointFrame(ckpt), textFrame("a1"), turnEndFrame()]);
+    await executor.executeAgent({
+      model,
+      body: { messages: [{ role: "user", content: "u1" }] },
+      stream: false,
+      credentials,
+    });
+    stubAgentSession(executor, [checkpointFrame(ckpt), textFrame("a2"), turnEndFrame()]);
+    await executor.executeAgent({
+      model,
+      body: { messages: [
+        { role: "user", content: "u1" },
+        { role: "assistant", content: "a1" },
+        { role: "user", content: "u2" },
+      ] },
+      stream: false,
+      credentials,
+    });
+    stubAgentSession(executor, [checkpointFrame(ckpt), textFrame("a3"), turnEndFrame()]);
+    await executor.executeAgent({
+      model,
+      body: { messages: [
+        { role: "user", content: "u1" },
+        { role: "assistant", content: "a1" },
+        { role: "user", content: "u2" },
+        { role: "assistant", content: "a2" },
+        { role: "user", content: "u3" },
+      ] },
+      stream: false,
+      credentials,
+    });
+
+    const written = stubAgentSession(executor, [textFrame("after"), turnEndFrame()]);
+    const result = await executor.executeAgent({
+      model,
+      body: { messages: [
+        { role: "user", content: "Summary of earlier conversation about the task" },
+        { role: "assistant", content: "ack" },
+        { role: "user", content: "continue" },
+      ] },
+      stream: false,
+      credentials,
+    });
+    expect(result.response.status).toBe(200);
+    const runRequest = decodeMessage(decodeMessage(written[0].subarray(5)).get(1)[0].value);
+    expect(Buffer.from(runRequest.get(1)[0].value).equals(ckpt)).toBe(true);
+  });
+
+  it("still resets when the first turn is replaced (not a multi-turn compact)", async () => {
+    const executor = new CursorExecutor();
+    stubAgentSession(executor, [checkpointFrame(Buffer.from([0x0a, 0x02, 0x68, 0x69])), textFrame("first"), turnEndFrame()]);
+    await executor.executeAgent({
+      model: "gpt-5.2-p3-lineage-edit",
+      body: { messages: [{ role: "user", content: "hi" }] },
+      stream: false,
+      credentials,
+    });
+    const written = stubAgentSession(executor, [textFrame("second"), turnEndFrame()]);
+    await executor.executeAgent({
+      model: "gpt-5.2-p3-lineage-edit",
+      body: { messages: [{ role: "user", content: "different" }] },
+      stream: false,
+      credentials,
+    });
+    const runRequest = decodeMessage(decodeMessage(written[0].subarray(5)).get(1)[0].value);
+    expect(runRequest.get(1)?.[0]?.value.length ?? 0).toBe(0);
   });
 });

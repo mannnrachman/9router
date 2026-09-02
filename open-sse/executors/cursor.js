@@ -38,6 +38,13 @@ import { FORMATS } from "../translator/formats.js";
 import { proxyAwareFetch, resolveOutboundProxyUrl } from "../utils/proxyFetch.js";
 import { connectHttp2 } from "../utils/http2Connect.js";
 import { resolveCursorModel, resolveCursorModelSelection } from "../services/cursorModels.js";
+import {
+  inferContextWindow,
+  getDefaultCursorContextWindow,
+  buildScaledCursorUsage,
+  isCursorUsageScalingEnabled,
+} from "../services/cursorContext.js";
+import { resolveSessionId } from "../utils/sessionManager.js";
 import zlib from "node:zlib";
 import { promises as fs } from "node:fs";
 import { spawn } from "node:child_process";
@@ -58,13 +65,14 @@ const CURSOR_MCP_RESULT_CAP = (() => {
 })();
 const CURSOR_CONTEXT_COMPACT_TRIGGER = 0.8;
 const CURSOR_CONTEXT_COMPACT_TARGET = 0.6;
-const CURSOR_DEFAULT_CONTEXT_WINDOW = 200_000;
+const CURSOR_ARCHIVE_TOKEN_RATIO = (() => {
+  const value = Number(process.env.CURSOR_ARCHIVE_TOKEN_RATIO);
+  return Number.isFinite(value) && value > 0 && value < 1 ? value : 0.70;
+})();
 
-function getCursorContextWindow() {
-  const configured = Number(process.env.CURSOR_CONTEXT_WINDOW);
-  return Number.isFinite(configured) && configured > 0
-    ? Math.floor(configured)
-    : CURSOR_DEFAULT_CONTEXT_WINDOW;
+function getCursorContextWindow(modelId = "") {
+  if (modelId) return inferContextWindow(modelId);
+  return getDefaultCursorContextWindow();
 }
 
 export function estimateCursorContextTokens(messages, tools = []) {
@@ -97,7 +105,7 @@ function capCursorToolXml(content) {
   ));
 }
 
-export function compactCursorMessages(messages, _model, tools = [], contextWindow = getCursorContextWindow()) {
+export function compactCursorMessages(messages, model, tools = [], contextWindow = getCursorContextWindow(model)) {
   if (!Array.isArray(messages) || messages.length < 3) return messages || [];
   const contextTokens = estimateCursorContextTokens(messages, tools);
   const trigger = Math.floor(contextWindow * CURSOR_CONTEXT_COMPACT_TRIGGER);
@@ -325,7 +333,7 @@ const CURSOR_TURN_ARCHIVE_THRESHOLD = (() => {
 const MAX_BLOBS_PER_OWNER = 128;
 const retainedAgentSessions = new Map();
 const retainedAgentToolCalls = new Map();
-const agentConversations = new Map(); // owner -> { conversationId, checkpoint, blobStore, turnCount, fingerprint }
+const agentConversations = new Map(); // owner -> { conversationId, checkpoint, blobStore, turnCount, fingerprint, userTexts, tokenUsage, effectiveContextWindow }
 
 function getAgentConversation(owner) {
   let conv = agentConversations.get(owner);
@@ -336,7 +344,9 @@ function getAgentConversation(owner) {
       blobStore: new Map(),
       turnCount: 0,
       fingerprint: null,
+      userTexts: [],
       tokenUsage: null,
+      effectiveContextWindow: null,
       outputTokens: 0,
       lastAccessMs: Date.now(),
       timer: null,
@@ -360,7 +370,9 @@ function resetAgentConversation(conv) {
   conv.blobStore.clear();
   conv.turnCount = 0;
   conv.fingerprint = null;
+  conv.userTexts = [];
   conv.tokenUsage = null;
+  conv.effectiveContextWindow = null;
   conv.outputTokens = 0;
 }
 
@@ -381,9 +393,52 @@ function extractUserTexts(body) {
     .map((message) => textFromContent(message?.content));
 }
 
-function validateConversationLineage(conv, userTexts) {
+function hasClientCompactMarker(body) {
+  for (const message of body?.messages || []) {
+    const text = textFromContent(message?.content);
+    if (!text) continue;
+    if (text.includes("[9router] Earlier context compacted")) return true;
+    if (/conversation (was )?summarized|earlier conversation|context compacted/i.test(text)) return true;
+  }
+  return false;
+}
+
+function isLikelyClientCompact(conv, userTexts, body) {
+  if (!conv.checkpoint) return false;
+  const turns = userTexts.slice(0, -1);
+  if (turns.length >= conv.turnCount) return false;
+  if (hasClientCompactMarker(body)) return true;
+  // Soft: dropped ≥2 prior turns. Empty prior after a single-turn chat stays a reset
+  // (edit/replace first message) — see lineage unit test.
+  const dropped = conv.turnCount - turns.length;
+  if (dropped < 2) return false;
+  if (Array.isArray(conv.userTexts) && turns.every((text, index) => text === conv.userTexts[index])) {
+    return true;
+  }
+  // Divergent short history after a multi-turn session → treat as client compact
+  // (pi-cursor keeps checkpoint; Cursor server state is source of truth).
+  return conv.turnCount >= 3;
+}
+
+function validateConversationLineage(conv, userTexts, body = null) {
   if (conv.checkpoint === null) return true; // nothing stored yet -> fresh
   const turns = userTexts.slice(0, -1);
+  if (isLikelyClientCompact(conv, userTexts, body)) return "compact";
+  if (Array.isArray(conv.userTexts) && conv.userTexts.length > 0) {
+    if (turns.length === conv.userTexts.length) {
+      return turns.every((text, index) => text === conv.userTexts[index]) ? true : false;
+    }
+    if (turns.length > conv.userTexts.length) {
+      return conv.userTexts.every((text, index) => text === turns[index]) ? true : false;
+    }
+    // Shorter: only treat as compact when a non-empty prefix still matches.
+    // Empty prior turns after a stored history means the first user message was
+    // replaced (edit/new chat), not a multi-turn compact.
+    if (turns.length > 0 && turns.every((text, index) => text === conv.userTexts[index])) {
+      return "compact";
+    }
+    return false;
+  }
   if (conv.turnCount !== turns.length) return false;
   if (conv.fingerprint === null) return true;
   return conv.fingerprint === computeLineageFingerprint(turns);
@@ -391,6 +446,13 @@ function validateConversationLineage(conv, userTexts) {
 
 function commitConversationTurn(conv, userTexts) {
   conv.turnCount = userTexts.length;
+  conv.userTexts = [...userTexts];
+  conv.fingerprint = computeLineageFingerprint(userTexts);
+}
+
+function resyncConversationLineageAfterCompact(conv, userTexts) {
+  conv.turnCount = userTexts.length;
+  conv.userTexts = [...userTexts];
   conv.fingerprint = computeLineageFingerprint(userTexts);
 }
 
@@ -466,29 +528,48 @@ function extractTextFromTurnBlob(turnBlobId, blobStore) {
     const step = decodeMessage(stepData);
     const message = step.get(1)?.[0]?.value;
     if (!message) continue;
-    const assistant = decodeMessage(message).get(1)?.[0]?.value;
-    if (!assistant) continue;
-    const text = extractAgentString(decodeMessage(assistant), 1);
-    if (text) lines.push(`Assistant: ${text.slice(0, 800)}`);
+    const decoded = decodeMessage(message);
+    const assistant = decoded.get(1)?.[0]?.value;
+    if (assistant) {
+      const text = extractAgentString(decodeMessage(assistant), 1);
+      if (text) lines.push(`Assistant: ${text.slice(0, 800)}`);
+      continue;
+    }
+    // Best-effort tool step: field 2 often carries tool-call payloads.
+    const tool = decoded.get(2)?.[0]?.value;
+    if (tool) {
+      const toolMsg = decodeMessage(tool);
+      const name = extractAgentString(toolMsg, 1) || extractAgentString(toolMsg, 5) || "tool";
+      lines.push(`Tool: ${String(name).slice(0, 120)}`);
+    }
   }
   return lines.length ? lines.join("\n") : null;
 }
 
-function archiveCheckpointTurns(checkpointBytes, blobStore) {
+function archiveCheckpointTurns(checkpointBytes, blobStore, {
+  turnThreshold = CURSOR_TURN_ARCHIVE_THRESHOLD,
+  force = false,
+} = {}) {
   if (!checkpointBytes?.length || !blobStore) return checkpointBytes;
   const state = decodeMessage(checkpointBytes);
   const turnIds = getStateTurnBlobIds(state);
-  if (turnIds.length <= CURSOR_TURN_ARCHIVE_THRESHOLD) return checkpointBytes;
+  if (!force && turnIds.length <= turnThreshold) return checkpointBytes;
 
-  const oldIds = turnIds.slice(0, turnIds.length - CURSOR_TURN_ARCHIVE_THRESHOLD);
-  const recentIds = turnIds.slice(-CURSOR_TURN_ARCHIVE_THRESHOLD);
+  const keep = Math.min(turnThreshold, turnIds.length);
+  if (keep >= turnIds.length) return checkpointBytes;
+  const oldIds = turnIds.slice(0, turnIds.length - keep);
+  const recentIds = turnIds.slice(-keep);
   const archiveLines = [`[Earlier conversation — ${oldIds.length} turn(s)]\n`];
+  let archivedCount = 0;
   for (let i = 0; i < oldIds.length; i++) {
     const text = extractTextFromTurnBlob(oldIds[i], blobStore);
-    if (!text) return checkpointBytes;
+    if (!text) continue; // pi-cursor: skip missing blobs; only archive when all representable
     archiveLines.push(`Turn ${i + 1}:\n${text}`);
     archiveLines.push("");
+    archivedCount++;
   }
+  // Conservative: only replace turns when every old turn could be represented.
+  if (archivedCount !== oldIds.length) return checkpointBytes;
 
   const archiveBlobId = storeCursorBlob(
     encodeConversationSummaryArchive({
@@ -512,6 +593,12 @@ function archiveCheckpointTurns(checkpointBytes, blobStore) {
   for (const id of getStateSummaryArchiveIds(state)) parts.push(encodeField(13, PROTOBUF_LEN, id));
   parts.push(encodeField(13, PROTOBUF_LEN, Buffer.from(archiveBlobId)));
   return concatBuffers(...parts);
+}
+
+function shouldArchiveByTokenUsage(tokenUsage, ratio = CURSOR_ARCHIVE_TOKEN_RATIO) {
+  const used = Number(tokenUsage?.used) || 0;
+  const max = Number(tokenUsage?.max) || 0;
+  return max > 0 && used > 0 && used / max >= ratio;
 }
 
 export function splitMessagesIntoTurns(messages) {
@@ -697,13 +784,19 @@ function normalizeAgentToolCallId(value) {
   return String(value || "").split("\n")[0].trim();
 }
 
-function agentSessionOwner(credentials, model) {
+function agentSessionOwner(credentials, model, body = null) {
   const account = credentials?.connectionId
     || credentials?.id
     || credentials?.accessToken
     || credentials?.apiKey
     || "anonymous";
-  return crypto.createHash("sha256").update(`${model}\0${account}`).digest("hex");
+  const sessionId = resolveSessionId({
+    headers: credentials?.rawHeaders,
+    body,
+    connectionId: account,
+    scope: "cursor",
+  });
+  return crypto.createHash("sha256").update(`${model}\0${account}\0${sessionId}`).digest("hex");
 }
 
 function retainedToolCallKey(owner, toolCallId) {
@@ -910,7 +1003,13 @@ export function buildAgentRunFrame(messages, model, tools = [], modelSelection =
   const priorMessages = chatMessages.slice(0, currentIndex >= 0 ? currentIndex : -1);
 
   if (conversationState && blobStore) {
-    conversationState = archiveCheckpointTurns(conversationState, blobStore);
+    const tokenForce = shouldArchiveByTokenUsage(resume?.tokenUsage);
+    conversationState = archiveCheckpointTurns(conversationState, blobStore, {
+      force: tokenForce,
+      turnThreshold: tokenForce
+        ? Math.max(5, Math.floor(CURSOR_TURN_ARCHIVE_THRESHOLD / 2))
+        : CURSOR_TURN_ARCHIVE_THRESHOLD,
+    });
   } else if (!conversationState && blobStore && priorMessages.length > 0) {
     const turns = splitMessagesIntoTurns(priorMessages);
     if (turns.length > CURSOR_TURN_ARCHIVE_THRESHOLD) {
@@ -1417,12 +1516,16 @@ export class CursorExecutor extends BaseExecutor {
     }
 
     const toolResults = extractCursorToolResults(body);
-    const sessionOwner = agentSessionOwner(credentials, model);
+    const sessionOwner = agentSessionOwner(credentials, model, body);
     const userTexts = extractUserTexts(body);
     const conv = getAgentConversation(sessionOwner);
-    if (!validateConversationLineage(conv, userTexts)) {
+    const lineage = validateConversationLineage(conv, userTexts, body);
+    if (lineage === false) {
       traceLog(runId, `lineage_mismatch reset conv=${conv.conversationId.slice(0, 8)}`);
       resetAgentConversation(conv);
+    } else if (lineage === "compact") {
+      traceLog(runId, `client_compact keep checkpoint conv=${conv.conversationId.slice(0, 8)}`);
+      resyncConversationLineageAfterCompact(conv, userTexts);
     }
 
     const reasoningEffort = body.reasoning_effort || body.reasoning?.effort || null;
@@ -1463,7 +1566,14 @@ export class CursorExecutor extends BaseExecutor {
       body.tools || [],
       modelSelection,
       reasoningEffort,
-      conv.conversationId ? { conversationId: conv.conversationId, checkpoint: conv.checkpoint, blobStore: conv.blobStore } : null,
+      conv.conversationId
+        ? {
+          conversationId: conv.conversationId,
+          checkpoint: conv.checkpoint,
+          blobStore: conv.blobStore,
+          tokenUsage: conv.tokenUsage,
+        }
+        : null,
     );
 
     // One full attempt: (re)open the session, write the run frame, consume.
@@ -1614,7 +1724,10 @@ export class CursorExecutor extends BaseExecutor {
                       const details = decodeMessage(td.value);
                       const used = extractAgentVarint(details, 1);
                       const max = extractAgentVarint(details, 2);
-                      if (typeof used === "number") conv.tokenUsage = { used, max: typeof max === "number" ? max : null };
+                      if (typeof used === "number") {
+                        conv.tokenUsage = { used, max: typeof max === "number" ? max : null };
+                        if (typeof max === "number" && max > 0) conv.effectiveContextWindow = max;
+                      }
                     }
                   } catch {}
                   traceLog(runId, `checkpoint bytes=${bytes.length}`);
@@ -1661,6 +1774,19 @@ export class CursorExecutor extends BaseExecutor {
                   session.write(createRequestContextResponse(execRequest, body.tools || []));
                 } else if (execEvent?.kind === "exec_list_mcp_resources") {
                   session.write(encodeAgentEmptyListMcpResources(execEvent.execMsgId, execEvent.execId));
+                } else if (execEvent?.kind === "exec_execute_hook" && execEvent.hookType === "pre_compact") {
+                  // Cursor pre-compact hook: aggressively archive old turns so the
+                  // upcoming summarize turn fetches O(tail) blobs, not O(history).
+                  if (conv.checkpoint?.length && conv.blobStore) {
+                    const archived = archiveCheckpointTurns(conv.checkpoint, conv.blobStore, {
+                      force: true,
+                      turnThreshold: Math.max(5, Math.floor(CURSOR_TURN_ARCHIVE_THRESHOLD / 2)),
+                    });
+                    if (archived?.length) conv.checkpoint = Buffer.from(archived);
+                    traceLog(runId, `pre_compact archive applied bytes=${conv.checkpoint?.length || 0}`);
+                  }
+                  const ack = encodeAgentNativeRejection(execEvent);
+                  if (ack) session.write(ack);
                 } else if (execEvent?.kind === "exec_mcp") {
                   const toolCallId = normalizeAgentToolCallId(
                     execEvent.toolCallId || execEvent.execId || `call_${crypto.randomUUID()}`
@@ -1790,12 +1916,15 @@ export class CursorExecutor extends BaseExecutor {
       const tokenUsage = conv.tokenUsage;
       const output = conv.outputTokens || 0;
       if (tokenUsage?.used) {
-        const total = Math.max(output, tokenUsage.used);
-        return {
-          prompt_tokens: Math.max(0, total - output),
-          completion_tokens: output,
-          total_tokens: total,
-        };
+        const scaled = buildScaledCursorUsage({
+          usedTokens: tokenUsage.used,
+          outputTokens: output,
+          cursorMaxTokens: tokenUsage.max || conv.effectiveContextWindow || 0,
+          modelId: model,
+          inferredWindow: inferContextWindow(model),
+          scaling: isCursorUsageScalingEnabled(),
+        });
+        if (scaled) return scaled;
       }
       return estimateUsage(body, contentLength, FORMATS.OPENAI);
     };
@@ -1909,7 +2038,15 @@ export class CursorExecutor extends BaseExecutor {
               model,
               delta: { tool_calls: [{ index: 0, ...event.value }] },
             })));
-            controller.enqueue(encoder.encode(chatChunkSse({ id: responseId, created, model, delta: {}, finishReason: "tool_calls" })));
+            const usage = buildAgentUsage(0);
+            controller.enqueue(encoder.encode(chatChunkSse({
+              id: responseId,
+              created,
+              model,
+              delta: {},
+              finishReason: "tool_calls",
+              usage,
+            })));
             clearKeepalive();
             controller.enqueue(encoder.encode(SSE_DONE));
             controller.close();
@@ -1923,7 +2060,15 @@ export class CursorExecutor extends BaseExecutor {
             controller.close();
           } else if (event.type === "done") {
             clearKeepalive();
-            controller.enqueue(encoder.encode(chatChunkSse({ id: responseId, created, model, delta: {}, finishReason: "stop" })));
+            const usage = buildAgentUsage(0);
+            controller.enqueue(encoder.encode(chatChunkSse({
+              id: responseId,
+              created,
+              model,
+              delta: {},
+              finishReason: "stop",
+              usage,
+            })));
             controller.enqueue(encoder.encode(SSE_DONE));
             controller.close();
           }
