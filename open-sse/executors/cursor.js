@@ -222,7 +222,8 @@ function shouldDropAgentCheckpoint(messages, model, tools, conv) {
 
 /** Retry empty upstream turns when a long session is likely wedged (235 MSG pattern). */
 function shouldRetryEmptyTurn(result, conv, messageCount) {
-  if (result.sawContent || result.keepSessionOpen) return false;
+  // tool_call sets sawContent; bare retained-session resume does not.
+  if (result.sawContent) return false;
   if (conv.checkpoint?.length) return true;
   if ((conv.emptyStreak || 0) > 0) return true;
   if (messageCount >= CURSOR_MSG_COMPACT_THRESHOLD) return true;
@@ -1677,7 +1678,11 @@ export class CursorExecutor extends BaseExecutor {
     const originalMessages = body.messages || [];
     const agentTools = body.tools || [];
     let compactLevel = 0;
-    if ((conv.emptyStreak || 0) >= 2) {
+    if (originalMessages.length >= CURSOR_MSG_COMPACT_THRESHOLD) {
+      compactLevel = 2;
+      resetAgentConversation(conv);
+      traceLog(runId, `long_session force reset msgs=${originalMessages.length}`);
+    } else if ((conv.emptyStreak || 0) >= 2) {
       const streak = conv.emptyStreak;
       compactLevel = 2;
       resetAgentConversation(conv);
@@ -1686,8 +1691,6 @@ export class CursorExecutor extends BaseExecutor {
       resetAgentConversation(conv);
       compactLevel = 1;
       traceLog(runId, `long_session drop checkpoint msgs=${originalMessages.length}`);
-    } else if (originalMessages.length >= CURSOR_MSG_COMPACT_THRESHOLD) {
-      compactLevel = 1;
     }
     let workingMessages = prepareLongSessionMessages(originalMessages, agentModel, agentTools, { level: compactLevel });
 
@@ -2004,7 +2007,11 @@ export class CursorExecutor extends BaseExecutor {
           if (heartbeatTimer) clearInterval(heartbeatTimer);
           if (safetyTimer) clearTimeout(safetyTimer);
           traceLog(runId, `consume_finally finished=${finished} pending=${pending.length}`);
-          if (keepSessionOpen && retainedState) {
+          if (keepSessionOpen && retainedState && !sawContent) {
+            traceLog(runId, "retained session empty — closing");
+            closeRetainedAgentSession(retainedState);
+            keepSessionOpen = false;
+          } else if (keepSessionOpen && retainedState) {
             retainedState.buffered = pending;
             releaseRetainedAgentSession(retainedState, true);
           } else {
@@ -2043,6 +2050,7 @@ export class CursorExecutor extends BaseExecutor {
           // Stale checkpoint or oversized replay often yields HTTP 200 with no
           // deltas — treat as retryable instead of a fake successful empty stop.
           if (shouldRetryEmptyTurn(result, conv, originalMessages.length)) {
+            debugLog(`[CURSOR AGENT ${runId}] empty_turn attempt=${attempt + 1} msgs=${originalMessages.length} sawContent=${result.sawContent} keepOpen=${result.keepSessionOpen}`);
             const err = new Error("empty_turn");
             err.retryHint = "empty_turn";
             throw err;
@@ -2190,6 +2198,7 @@ export class CursorExecutor extends BaseExecutor {
         keepaliveTimer.unref?.();
 
         let streamClosed = false;
+        let streamHadContent = false;
         const finishStream = ({ finishReason = "stop", contentLength = 0 } = {}) => {
           if (streamClosed) return;
           streamClosed = true;
@@ -2211,12 +2220,15 @@ export class CursorExecutor extends BaseExecutor {
         // first empty upstream turn wedges Cursor before empty_turn can retry.
         runWithRetry((event) => {
           if (event.type === "text") {
+            streamHadContent = true;
             markStreamOutput();
             controller.enqueue(encoder.encode(chatChunkSse({ id: responseId, created, model, delta: { content: event.value } })));
           } else if (event.type === "thinking") {
+            streamHadContent = true;
             markStreamOutput();
             controller.enqueue(encoder.encode(chatChunkSse({ id: responseId, created, model, delta: { reasoning_content: event.value } })));
           } else if (event.type === "tool_call") {
+            streamHadContent = true;
             markStreamOutput();
             controller.enqueue(encoder.encode(chatChunkSse({
               id: responseId,
@@ -2237,7 +2249,9 @@ export class CursorExecutor extends BaseExecutor {
             controller.close();
           }
         }).then((result) => {
-          if (!result?.keepSessionOpen) finishStream();
+          if (result?.keepSessionOpen) return;
+          if (streamHadContent) finishStream();
+          else closeWithAgentError(Object.assign(new Error("context_exhausted"), { retryHint: "context_exhausted" }));
         }).catch((error) => closeWithAgentError(error));
       },
       cancel() {
