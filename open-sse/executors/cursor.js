@@ -2189,6 +2189,26 @@ export class CursorExecutor extends BaseExecutor {
         }, CURSOR_SSE_KEEPALIVE_MS);
         keepaliveTimer.unref?.();
 
+        let streamClosed = false;
+        const finishStream = ({ finishReason = "stop", contentLength = 0 } = {}) => {
+          if (streamClosed) return;
+          streamClosed = true;
+          clearKeepalive();
+          const usage = buildAgentUsage(contentLength);
+          controller.enqueue(encoder.encode(chatChunkSse({
+            id: responseId,
+            created,
+            model,
+            delta: {},
+            finishReason,
+            usage,
+          })));
+          controller.enqueue(encoder.encode(SSE_DONE));
+          controller.close();
+        };
+
+        // Defer terminal SSE until runWithRetry succeeds. Emitting stop on the
+        // first empty upstream turn wedges Cursor before empty_turn can retry.
         runWithRetry((event) => {
           if (event.type === "text") {
             markStreamOutput();
@@ -2204,40 +2224,20 @@ export class CursorExecutor extends BaseExecutor {
               model,
               delta: { tool_calls: [{ index: 0, ...event.value }] },
             })));
-            const usage = buildAgentUsage(0);
-            controller.enqueue(encoder.encode(chatChunkSse({
-              id: responseId,
-              created,
-              model,
-              delta: {},
-              finishReason: "tool_calls",
-              usage,
-            })));
-            clearKeepalive();
-            controller.enqueue(encoder.encode(SSE_DONE));
-            controller.close();
+            finishStream({ finishReason: "tool_calls" });
           } else if (event.type === "error") {
             // An SSE error frame, not a content delta: a protocol failure must not
             // be rendered to the user as the assistant's reply, and downstream
             // usage tracking must not record the turn as a success.
+            if (streamClosed) return;
+            streamClosed = true;
             clearKeepalive();
             controller.enqueue(encoder.encode(sseChunk({ error: { message: event.value, type: "api_error" } })));
             controller.enqueue(encoder.encode(SSE_DONE));
             controller.close();
-          } else if (event.type === "done") {
-            clearKeepalive();
-            const usage = buildAgentUsage(0);
-            controller.enqueue(encoder.encode(chatChunkSse({
-              id: responseId,
-              created,
-              model,
-              delta: {},
-              finishReason: "stop",
-              usage,
-            })));
-            controller.enqueue(encoder.encode(SSE_DONE));
-            controller.close();
           }
+        }).then((result) => {
+          if (!result?.keepSessionOpen) finishStream();
         }).catch((error) => closeWithAgentError(error));
       },
       cancel() {

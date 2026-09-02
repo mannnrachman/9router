@@ -868,6 +868,58 @@ describe("Cursor AgentService thinking, blobs, checkpoint, retry (pi-cursor pari
     expect(payload.choices[0].message.content).toBe("recovered-long");
   });
 
+  it("retries empty_turn in streaming mode without emitting an early empty stop", async () => {
+    vi.useFakeTimers();
+    const executor = new CursorExecutor();
+    const checkpointBytes = Buffer.from([0x0a, 0x02, 0x68, 0x69]);
+    stubAgentSession(executor, [checkpointFrame(checkpointBytes), textFrame("first"), turnEndFrame()]);
+    await executor.executeAgent({
+      model: "gpt-5.2-empty-stream",
+      body: { messages: [{ role: "user", content: "hi" }] },
+      stream: false,
+      credentials,
+    });
+
+    let opens = 0;
+    executor.openAgentHttp2Stream = async () => {
+      opens += 1;
+      const queue = opens === 1
+        ? [turnEndFrame()]
+        : [textFrame("recovered-stream"), turnEndFrame()];
+      return {
+        responseHeaders: Promise.resolve({ ":status": 200 }),
+        write() {},
+        end() {},
+        close() {},
+        async read() {
+          if (!queue.length) return { value: undefined, done: true };
+          return { value: queue.shift(), done: false };
+        },
+      };
+    };
+
+    const resultPromise = executor.executeAgent({
+      model: "gpt-5.2-empty-stream",
+      body: {
+        messages: [
+          { role: "user", content: "hi" },
+          { role: "assistant", content: "first" },
+          { role: "user", content: "again" },
+        ],
+      },
+      stream: true,
+      credentials,
+    });
+    await vi.advanceTimersByTimeAsync(5000);
+    const result = await resultPromise;
+    const body = await result.response.text();
+    const events = parseSSE(body);
+    const content = events.map((e) => e.choices?.[0]?.delta?.content || "").join("");
+    expect(content).toBe("recovered-stream");
+    expect(opens).toBeGreaterThanOrEqual(2);
+    expect(events.some((e) => e.choices?.[0]?.finish_reason === "stop")).toBe(true);
+  });
+
   it("retries blob_not_found with a fresh session and resets the conversation", async () => {
     const executor = new CursorExecutor();
     let openCount = 0;
