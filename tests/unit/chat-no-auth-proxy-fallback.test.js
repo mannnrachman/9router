@@ -59,14 +59,18 @@ vi.mock("open-sse/services/capacityAdapter.js", () => ({
 vi.mock("open-sse/utils/bypassHandler.js", () => ({
   handleBypassRequest: vi.fn(() => null),
 }));
-vi.mock("open-sse/config/runtimeConfig.js", () => ({
-  HTTP_STATUS: {
-    BAD_REQUEST: 400,
-    UNAUTHORIZED: 401,
-    NOT_FOUND: 404,
-    SERVICE_UNAVAILABLE: 503,
-  },
-}));
+vi.mock("open-sse/config/runtimeConfig.js", async (importOriginal) => {
+  const actual = await importOriginal();
+  return {
+    ...actual,
+    HTTP_STATUS: {
+      BAD_REQUEST: 400,
+      UNAUTHORIZED: 401,
+      NOT_FOUND: 404,
+      SERVICE_UNAVAILABLE: 503,
+    },
+  };
+});
 vi.mock("open-sse/translator/formats.js", () => ({
   detectFormatByEndpoint: vi.fn(() => null),
 }));
