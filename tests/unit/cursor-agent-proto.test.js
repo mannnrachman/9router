@@ -426,11 +426,16 @@ describe("Cursor AgentService executor helpers (cursor.js)", () => {
       expect(clientMsg.has(1)).toBe(true); // run_request
       const run = decodeMessage(clientMsg.get(1)[0].value);
       expect(run.has(2)).toBe(true); // action
+      expect(run.has(3)).toBe(true); // ModelDetails — required or thinking models return an empty turn
       expect(run.has(8)).toBe(false); // custom_system_prompt must stay unset
       expect(run.has(9)).toBe(true); // requested_model
+      const details = decodeMessage(run.get(3)[0].value);
+      expect(Buffer.from(details.get(1)[0].value).toString("utf8")).toBe("gpt-5.2");
       const action = decodeMessage(run.get(2)[0].value);
       const userAction = decodeMessage(action.get(1)[0].value);
       const userMsg = decodeMessage(userAction.get(1)[0].value);
+      expect(userMsg.has(3)).toBe(true); // selected_context
+      expect(userMsg.get(4)[0].value).toBe(1); // mode=1
       const text = Buffer.from(userMsg.get(1)[0].value).toString("utf8");
       expect(text).toContain("be brief");
       expect(text).toContain("hi");
@@ -453,7 +458,9 @@ describe("Cursor AgentService executor helpers (cursor.js)", () => {
       ));
       const run = decodeMessage(decodeMessage(frame).get(1)[0].value);
       const requested = decodeMessage(run.get(9)[0].value);
+      const details = decodeMessage(run.get(3)[0].value);
 
+      expect(Buffer.from(details.get(1)[0].value).toString("utf8")).toBe("grok-4.5");
       expect(Buffer.from(requested.get(1)[0].value).toString("utf8")).toBe("grok-4.5");
       expect(requested.get(3)).toHaveLength(2);
       expect(requested.get(3).map(({ value }) => {

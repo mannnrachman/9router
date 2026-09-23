@@ -1204,9 +1204,13 @@ export function buildAgentRunFrame(messages, model, tools = [], modelSelection =
   const userText = foldSystemIntoUserMessage(system, currentText);
 
   // agent.v1.UserMessageAction.user_message and its optional history.
+  // selected_context (3) + mode=1 (4) match cursor-agent's wire format; without
+  // them AgentService can accept the RPC and stream an empty turn.
   const userMessage = concatBuffers(
     agentString(1, userText),
     agentString(2, crypto.randomUUID()),
+    agentMessage(3, new Uint8Array()),
+    encodeField(4, PROTOBUF_VARINT, 1),
   );
   const conversationHistory = history.length
     ? concatBuffers(...history.map((entry) => agentMessage(1, entry)))
@@ -1217,10 +1221,19 @@ export function buildAgentRunFrame(messages, model, tools = [], modelSelection =
   );
   const conversationAction = agentMessage(1, userAction);
   const requestedModel = encodeRequestedAgentModel(model, modelSelection, reasoningEffort);
+  // ModelDetails (field 3). Thinking variants (Composer, Grok, *-thinking)
+  // return an empty turn when only RequestedModel (field 9) is set.
+  const modelId = modelSelection?.modelId || model;
+  const modelDetails = concatBuffers(
+    agentString(1, modelId),
+    agentString(3, modelId),
+    agentString(4, modelId),
+  );
   const runRequest = concatBuffers(
     // An empty ConversationStateStructure starts a fresh local agent session.
     agentMessage(1, conversationState || new Uint8Array()),
     agentMessage(2, conversationAction),
+    agentMessage(3, modelDetails),
     ...(omitTools || !tools.length ? [] : [agentMessage(4, encodeMcpTools(tools))]),
     ...(conversationId ? [agentString(5, conversationId)] : []),
     agentMessage(9, requestedModel),
