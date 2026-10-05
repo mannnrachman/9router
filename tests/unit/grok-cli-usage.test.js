@@ -90,8 +90,8 @@ describe("parseGrokCliBilling", () => {
 
   it("marks depleted free/promo account as exhausted", () => {
     const parsed = parseGrokCliBilling(EXHAUSTED_BILLING, USER_PROFILE);
-    expect(parsed.quotas["On-demand"].remainingPercentage).toBe(0);
-    expect(parsed.exhausted).toBe(true);
+    expect(parsed.quotas).not.toHaveProperty("On-demand");
+    expect(parsed.exhausted).toBe(false);
   });
 
   it("uses subscriptionTier for plan when present", () => {
@@ -306,13 +306,11 @@ describe("getUsageForProvider(grok-cli)", () => {
       accessToken: "test-token",
     });
 
-    // Dashboard hides QuotaTable when `message` is set — keep message empty
-    // so the 0% bar still renders for exhausted free/promo accounts.
-    expect(usage.message).toBeUndefined();
-    expect(usage.quotas["On-demand"].remainingPercentage).toBe(0);
-    expect(usage.quotas["On-demand"].total).toBe(1);
-    // Exhausted free already has a quota bar — no gRPC fallback
-    expect(proxyAwareFetch.mock.calls).toHaveLength(2);
+    // Missing allocation must not fabricate a depleted quota bar.
+    expect(usage.message).toContain("no credit allotment was returned");
+    expect(usage.quotas).not.toHaveProperty("On-demand");
+    // Unknown REST allocation triggers the existing gRPC fallback probe.
+    expect(proxyAwareFetch.mock.calls).toHaveLength(3);
   });
 
   it("falls back to GetGrokCreditsConfig gRPC when paid sub has no REST numeric quota", async () => {
