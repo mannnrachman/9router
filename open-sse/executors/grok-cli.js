@@ -244,6 +244,7 @@ function normalizeGrokCliTools(body) {
   if (!Array.isArray(body.tools) || body.tools.length === 0) {
     delete body.tools;
     delete body.tool_choice;
+    delete body.parallel_tool_calls;
     return;
   }
   const validNames = new Set();
