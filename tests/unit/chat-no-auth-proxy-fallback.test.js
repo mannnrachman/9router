@@ -59,7 +59,8 @@ vi.mock("open-sse/services/capacityAdapter.js", () => ({
 vi.mock("open-sse/utils/bypassHandler.js", () => ({
   handleBypassRequest: vi.fn(() => null),
 }));
-vi.mock("open-sse/config/runtimeConfig.js", () => ({
+vi.mock("open-sse/config/runtimeConfig.js", async (importOriginal) => ({
+  ...(await importOriginal()),
   HTTP_STATUS: {
     BAD_REQUEST: 400,
     UNAUTHORIZED: 401,
@@ -67,7 +68,8 @@ vi.mock("open-sse/config/runtimeConfig.js", () => ({
     SERVICE_UNAVAILABLE: 503,
   },
 }));
-vi.mock("open-sse/translator/formats.js", () => ({
+vi.mock("open-sse/translator/formats.js", async (importOriginal) => ({
+  ...(await importOriginal()),
   detectFormatByEndpoint: vi.fn(() => null),
 }));
 vi.mock("@/sse/utils/logger.js", () => ({
@@ -137,6 +139,7 @@ describe("chat no-auth proxy fallback", () => {
     expect(response.status).toBe(200);
     expect(mocks.getProviderCredentials).toHaveBeenCalledTimes(2);
     expect(mocks.getProviderCredentials.mock.calls[1][3]).toEqual({
+      requestedModel: "deepseek-v4-flash-free",
       excludeProxyPoolIds: new Set(["pool-a"]),
     });
     expect(mocks.markAccountUnavailable).toHaveBeenCalledWith(
@@ -202,7 +205,7 @@ describe("chat no-auth proxy fallback", () => {
 
     const response = await handleChat(request);
 
-    expect(response.status).toBe(429);
+    expect(response.status).toBe(503);
     expect(mocks.getProviderCredentials).toHaveBeenCalledTimes(3);
     expect(exclusionSnapshots).toEqual([
       new Set(),
@@ -211,10 +214,11 @@ describe("chat no-auth proxy fallback", () => {
     ]);
     expect(mocks.markAccountUnavailable).toHaveBeenCalledTimes(2);
     expect(mocks.unavailableResponse).toHaveBeenCalledWith(
-      429,
+      503,
       expect.stringContaining("429 from pool-b"),
       "2026-08-13T00:00:10.000Z",
       "reset after 10s",
+      {},
     );
   });
 });
