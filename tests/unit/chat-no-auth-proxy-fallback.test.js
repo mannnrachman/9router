@@ -192,7 +192,9 @@ describe("chat no-auth proxy fallback", () => {
     mocks.handleChatCore.mockReset();
     mocks.handleChatCore
       .mockResolvedValueOnce({ success: false, status: 429, error: "429 from pool-a", resetsAtMs: null })
-      .mockResolvedValueOnce({ success: false, status: 429, error: "429 from pool-b", resetsAtMs: null });
+      .mockResolvedValueOnce({ success: false, status: 429, error: "429 from pool-b", resetsAtMs: null,
+        response: new Response("limited", { status: 429, headers: { "retry-after": "10", "anthropic-ratelimit-requests-remaining": "0" } }),
+      });
 
     const request = new Request("http://router.test/v1/chat/completions", {
       method: "POST",
@@ -218,7 +220,7 @@ describe("chat no-auth proxy fallback", () => {
       expect.stringContaining("429 from pool-b"),
       "2026-08-13T00:00:10.000Z",
       "reset after 10s",
-      {},
+      expect.objectContaining({ "retry-after": "10", "anthropic-ratelimit-requests-remaining": "0" }),
     );
   });
 });
