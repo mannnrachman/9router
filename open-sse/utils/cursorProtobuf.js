@@ -1502,7 +1502,7 @@ export default {
   parseConnectRPCFrame,
   extractTextFromResponse,
   encodeToolResult,
-  encodeToolResultRequest,
+  buildToolResultRequest,
   generateToolResultBody,
   encodeCursorSetting,
   encodeInstruction,

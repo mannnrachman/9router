@@ -6,7 +6,7 @@ vi.mock("http2", () => ({ default: { connect: connectMock } }));
 import {
   clearCursorModelCache,
   expandCursorModelAliases,
-  parseCursorAvailableModels,
+  parseCursorCatalogModels,
   parseCursorUsableModels,
   resolveCursorModel,
   resolveCursorModelSelection,
@@ -139,7 +139,7 @@ describe("Cursor live model catalog", () => {
       ],
     });
 
-    const models = parseCursorAvailableModels(payload);
+    const models = parseCursorCatalogModels(payload);
     expect(models).toHaveLength(1);
     expect(models[0]).toMatchObject({ id: "grok-4.5", name: "Grok 4.5" });
     expect(expandCursorModelAliases(models).map((model) => model.id)).toEqual([
@@ -186,7 +186,7 @@ describe("Cursor live model catalog", () => {
       )),
     );
 
-    const models = parseCursorAvailableModels(payload);
+    const models = parseCursorCatalogModels(payload);
     expect(resolveCursorModelSelection(models, "auto")).toMatchObject({
       modelId: "grok-4.5",
       matchedBy: "auto-default",
@@ -211,7 +211,7 @@ describe("Cursor live model catalog", () => {
       )),
     );
 
-    const models = parseCursorAvailableModels(payload);
+    const models = parseCursorCatalogModels(payload);
     expect(resolveCursorModelSelection(models, "auto")).toMatchObject({
       modelId: "grok-4.5",
       matchedBy: "auto-default",
@@ -226,7 +226,7 @@ describe("Cursor live model catalog", () => {
         varintField(4, 1), // is_chat_only
       )),
     );
-    expect(resolveCursorModelSelection(parseCursorAvailableModels(payload), "auto")).toBeNull();
+    expect(resolveCursorModelSelection(parseCursorCatalogModels(payload), "auto")).toBeNull();
   });
 
   it("fetches the account-specific catalog and caches it", async () => {
@@ -237,34 +237,9 @@ describe("Cursor live model catalog", () => {
       providerSpecificData: { machineId: "machine-id" },
     };
 
-    await expect(resolveCursorModels(credentials)).resolves.toEqual({
-      models: [{
-        id: "claude-4.6-opus",
-        name: "Claude 4.6 Opus",
-        serverModelName: "",
-        defaultOn: false,
-        isChatOnly: false,
-        supportsAgent: false,
-        isHidden: false,
-        legacySlugs: [],
-        idAliases: [],
-        variants: [],
-      }],
-    });
-    await expect(resolveCursorModels(credentials)).resolves.toEqual({
-      models: [{
-        id: "claude-4.6-opus",
-        name: "Claude 4.6 Opus",
-        serverModelName: "",
-        defaultOn: false,
-        isChatOnly: false,
-        supportsAgent: false,
-        isHidden: false,
-        legacySlugs: [],
-        idAliases: [],
-        variants: [],
-      }],
-    });
+    const expectedCatalogEntry = parseCursorCatalogModels(availableModel({ id: "claude-4.6-opus", name: "Claude 4.6 Opus" }));
+    await expect(resolveCursorModels(credentials)).resolves.toEqual({ models: expectedCatalogEntry });
+    await expect(resolveCursorModels(credentials)).resolves.toEqual({ models: expectedCatalogEntry });
 
     expect(connectMock).toHaveBeenCalledTimes(1);
   });

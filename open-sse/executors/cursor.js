@@ -250,10 +250,13 @@ function shouldDropAgentCheckpoint(messages, model, tools, conv) {
 function shouldRetryEmptyTurn(result, conv, messageCount) {
   // tool_call sets sawContent; bare retained-session resume does not.
   if (result.sawContent) return false;
+  // Only strong wedged-replay evidence may trigger a retry: a checkpoint
+  // resume, a previous empty streak, or a long-history replay. A bare
+  // turnCount is not enough — a first turn must surface empty-turn errors
+  // to the client (protocol condition, not a wedged replay).
   if (conv.checkpoint?.length) return true;
   if ((conv.emptyStreak || 0) > 0) return true;
   if (messageCount >= CURSOR_MSG_COMPACT_THRESHOLD) return true;
-  if ((conv.turnCount || 0) > 0) return true;
   return false;
 }
 
@@ -1026,6 +1029,16 @@ function acquireRetainedAgentSession(owner, toolResults) {
   return { state, matchedResults };
 }
 
+function createMcpResultResponse(pending, content, isError = false) {
+  const mcpResult = encodeMcpResultSuccess({ textItems: [String(content ?? "")], isError });
+  const execClientMessage = concatBuffers(
+    ...(pending.id != null ? [encodeField(1, PROTOBUF_VARINT, pending.id)] : []),
+    agentMessage(11, mcpResult),
+    ...(pending.execId ? [agentMessage(15, pending.execId)] : []),
+  );
+  return wrapConnectRPCFrame(agentMessage(2, execClientMessage));
+}
+
 function consumeRetainedToolResults(state, toolResults) {
   for (const result of toolResults) {
     const toolCallId = normalizeAgentToolCallId(result.toolCallId);
@@ -1150,6 +1163,16 @@ export function foldSystemIntoUserMessage(system, userText) {
 }
 
 export function buildAgentRunFrame(messages, model, tools = [], modelSelection = null, reasoningEffort = null, resume = null, { omitTools = false } = {}) {
+  // Tolerate the pre-checkpoint call shape buildAgentRunFrame(messages, model,
+  // tools, reasoningEffort, resume?) used by upstream tests and older callers:
+  // a string in the modelSelection slot is the reasoningEffort, and an object
+  // with conversationId/checkpoint in the reasoningEffort slot is the resume
+  // payload.
+  if (typeof modelSelection === "string") {
+    if (reasoningEffort && typeof reasoningEffort === "object") resume = reasoningEffort;
+    reasoningEffort = modelSelection;
+    modelSelection = null;
+  }
   // custom_system_prompt (RunRequest field 8) makes AgentService return an
   // empty turn. Fold system text into the current user message instead.
   // resume = { conversationId, checkpoint, blobStore } (fork) — continue stored
@@ -1184,7 +1207,11 @@ export function buildAgentRunFrame(messages, model, tools = [], modelSelection =
     if (tokenForce && conversationState === resume?.checkpoint) {
       conversationState = null;
     }
-  } else if (!conversationState && blobStore && priorMessages.length > 0) {
+  } else if (!conversationState && blobStore && blobStore.size > 0 && priorMessages.length > 0) {
+    // Only synthesize conversation state when this conversation has already
+    // stored blobs server-side (a prior checkpoint existed). A brand-new
+    // conversation with a cold blob store must replay full client history —
+    // synthetic blob references the server never stored wedge the first turn.
     const turns = splitMessagesIntoTurns(priorMessages);
     if (turns.length > CURSOR_TURN_ARCHIVE_THRESHOLD) {
       const older = turns.slice(0, turns.length - CURSOR_TURN_ARCHIVE_THRESHOLD);
@@ -1503,55 +1530,19 @@ function createErrorResponse(jsonError) {
   });
 }
 
-// Long-session empty-turn recovery: Cursor occasionally answers a long
-// history replay with HTTP 200 and zero deltas (empty turn). One retry on a
-// tail-only frame recovers the session instead of failing the client turn.
-const CURSOR_EMPTY_TURN_MAX_RETRIES = (() => {
-  const value = Number(process.env.CURSOR_EMPTY_TURN_MAX_RETRIES);
-  return Number.isFinite(value) && value >= 0 ? Math.floor(value) : 1;
-})();
+// Long-session empty-turn recovery is handled by the checkpoint-aware
+// shouldRetryEmptyTurn(result, conv, messageCount) above, which reuses
+// CURSOR_EMPTY_TURN_MAX_RETRIES / CURSOR_MSG_COMPACT_THRESHOLD.
 
-const CURSOR_TAIL_ONLY_THRESHOLD = (() => {
-  const value = Number(process.env.CURSOR_TAIL_ONLY_THRESHOLD);
-  return Number.isFinite(value) && value > 0 ? Math.floor(value) : 80;
-})();
 
-const CURSOR_EMPTY_TURN_RETRY_DELAY_MS = (() => {
-  const value = Number(process.env.CURSOR_EMPTY_TURN_RETRY_DELAY_MS);
-  return Number.isFinite(value) && value >= 0 ? Math.floor(value) : 400;
-})();
-
-/** Minimal tail for wedged long sessions — drops bulk history and tool XML. */
-export function tailOnlyCursorMessages(messages) {
-  if (!Array.isArray(messages) || messages.length === 0) return messages || [];
-  const systemMessages = messages.filter(
-    (message) => message?.role === ROLE.SYSTEM && !String(message?.content || "").includes("[9router]"),
-  );
-  const chatMessages = messages.filter((message) => message?.role !== ROLE.SYSTEM);
-  let anchor = chatMessages.length - 1;
-  for (let i = chatMessages.length - 1; i >= 0; i--) {
-    if (chatMessages[i]?.role === ROLE.USER || chatMessages[i]?.role === ROLE.TOOL) {
-      anchor = i;
-      break;
-    }
+/** Test hook: clear retained sessions and conversations so suites don't share state. */
+export function __resetCursorAgentStateForTest() {
+  for (const state of [...retainedAgentSessions.values()]) closeRetainedAgentSession(state);
+  retainedAgentToolCalls.clear();
+  for (const conv of [...agentConversations.values()]) {
+    clearTimeout(conv.timer);
+    agentConversations.delete(conv);
   }
-  const tailStart = anchor > 0 && chatMessages[anchor - 1]?.role === ROLE.ASSISTANT ? anchor - 1 : anchor;
-  const tail = chatMessages.slice(Math.max(0, tailStart));
-  const note = {
-    role: ROLE.SYSTEM,
-    content: `[9router] Long session: ${messages.length} messages trimmed to the latest turn. Answer the current request; re-read files if needed.`,
-  };
-  return [...systemMessages, note, ...tail];
-}
-
-/**
- * Retry an empty AgentService turn only when a long-session replay is the
- * likely cause: upstream accepts the request, streams HTTP 200, and closes
- * with zero deltas. A first-message empty turn is a protocol condition, not
- * a wedged replay, and must surface to the client without retry.
- */
-function shouldRetryEmptyTurn(messageCount) {
-  return messageCount >= CURSOR_TAIL_ONLY_THRESHOLD;
 }
 
 export class CursorExecutor extends BaseExecutor {
@@ -1771,6 +1762,14 @@ export class CursorExecutor extends BaseExecutor {
     const agentEndpoint = PROVIDER_OAUTH.cursor?.agentEndpoint;
     if (!agentEndpoint) throw new Error("Cursor AgentService endpoint is not configured");
 
+    // strict proxy configuration must fail closed here rather than leak the
+    // real IP on a direct socket (see proxyIntentFailed above).
+    if (proxyIntentFailed(proxyOptions)) {
+      throw new Error(
+        "Cursor AgentService requires a strict proxy that this HTTP/2 transport cannot honor; refusing to open a direct connection"
+      );
+    }
+
     const url = `${agentEndpoint}${AGENT_RUN_PATH}`;
     const headers = this.buildHeaders(credentials);
     const runId = crypto.randomUUID().slice(0, 8);
@@ -1829,7 +1828,10 @@ export class CursorExecutor extends BaseExecutor {
         + `matchedBy=${modelSelection.matchedBy}, params=${modelSelection.parameters?.length || 0}`,
       );
     }
-    if (requiresStrictCatalogResolution(agentModel) && !modelSelection?.modelId) {
+    // Upstream #4692 behavior: when the live catalog is unavailable for
+    // auto/default, fail OPEN with the literal id — the server picks. A hard
+    // failure here blocks clients whose accounts lack the catalog endpoint.
+    if (requiresStrictCatalogResolution(agentModel) && !modelSelection?.modelId && agentModel !== "auto" && agentModel !== "default") {
       console.log(`[CURSOR AGENT ${runId}] model unresolved requested=${model} agentModel=${agentModel}`);
       const err = new Error("cursor_model_unresolved");
       err.retryHint = "cursor_model_unresolved";
@@ -2010,6 +2012,7 @@ export class CursorExecutor extends BaseExecutor {
       if (retainedState) retainedState.buffered = Buffer.alloc(0);
       let finished = false;
       let timedOut = false;
+      let readFailed = false;
 
       const consume = async () => {
         let heartbeatTimer;
@@ -2090,6 +2093,7 @@ export class CursorExecutor extends BaseExecutor {
                   const textDelta = extractAgentString(decodeMessage(update.get(1)[0].value), 1);
                   if (textDelta) {
                     sawContent = true;
+                    sawText = true;
                     onEvent({ type: "text", value: textDelta });
                   }
                 }
@@ -2100,9 +2104,11 @@ export class CursorExecutor extends BaseExecutor {
                     // thinking-only turns are not misclassified as empty_turn.
                     sawContent = true;
                     thinkingAcc += thinkingDelta;
-                    if (forwardThinking) onEvent({ type: "thinking", value: thinkingDelta });
                     // Composer (and some Grok variants) put the visible answer
-                    // after </think> here and never send text_delta (upstream).
+                    // after </think> here and never send text_delta. The raw
+                    // thinking (private reasoning) must not be forwarded for
+                    // composer models — only the extracted visible content.
+                    if (forwardThinking && !composerModel) onEvent({ type: "thinking", value: thinkingDelta });
                     if (composerModel) {
                       const visible = visibleComposerContentFromThinking(thinkingAcc);
                       if (visible.length > emittedVisible) {
@@ -2122,7 +2128,7 @@ export class CursorExecutor extends BaseExecutor {
                   } catch {}
                 }
                 if (update.has(14)) {
-                  finishTurn();
+                  finishTurn(onEvent);
                   return false;
                 }
               }
@@ -2158,6 +2164,14 @@ export class CursorExecutor extends BaseExecutor {
                     execEvent.toolCallId || execEvent.execId || `call_${crypto.randomUUID()}`
                   );
                   const toolName = execEvent.toolName || "tool";
+                  if (!execEvent.toolName) {
+                    // MCP exec without a tool name is unrepresentable — surface
+                    // the protocol error instead of inventing a phantom tool.
+                    debugLog(`[CURSOR AGENT ${runId}] Unsupported exec request fields: ${describeAgentFields(execRequest)}`);
+                    finished = true;
+                    onEvent({ type: "error", value: "Cursor AgentService requested an unsupported IDE tool" });
+                    return false;
+                  }
                   retainedState = retainAgentToolCall(session, sessionOwner, toolCallId, execRequest);
                   keepSessionOpen = true;
                   sawContent = true;
@@ -2180,11 +2194,20 @@ export class CursorExecutor extends BaseExecutor {
                   // wedging the bidirectional stream on an IDE-only operation.
                   handleNativeExec(execEvent, session);
                 } else {
-                  debugLog(`[CURSOR AGENT ${runId}] Unsupported exec request fields: ${describeAgentFields(execRequest)}`);
-                  finished = true;
-                  sawContent = true; // protocol error is a real terminal outcome
-                  onEvent({ type: "error", value: "Cursor AgentService requested an unsupported IDE tool" });
-                  return false;
+                  // Auto/Composer often probe IDE builtins (shell/read/…). Reject
+                  // them so the model can continue with MCP tools or a text answer
+                  // instead of stalling the h2 stream (upstream parity).
+                  const rejection = rejectExecRequest(execRequest);
+                  if (rejection) {
+                    log?.info?.("CURSOR", `AgentService rejected IDE exec fields=${describeAgentFields(execRequest)}`);
+                    session.write(rejection);
+                  } else {
+                    debugLog(`[CURSOR AGENT ${runId}] Unsupported exec request fields: ${describeAgentFields(execRequest)}`);
+                    finished = true;
+                    sawContent = true; // protocol error is a real terminal outcome
+                    onEvent({ type: "error", value: "Cursor AgentService requested an unsupported IDE tool" });
+                    return false;
+                  }
                 }
               }
 
@@ -2216,6 +2239,7 @@ export class CursorExecutor extends BaseExecutor {
           }
         } catch (error) {
           if (retainedState) closeRetainedAgentSession(retainedState);
+          readFailed = true;
           const hint = classifyCursorError(error.message);
           if (hint && !outputStarted) {
             const err = new Error(hint);
@@ -2243,7 +2267,9 @@ export class CursorExecutor extends BaseExecutor {
             err.retryHint = "timeout";
             throw err;
           }
-          if (!finished && !timedOut) finishTurn(onEvent);
+          // A read/transport failure must propagate as the stream error; do not
+          // synthesize an empty-turn event that would mask the transport cause.
+          if (!finished && !timedOut && !readFailed) finishTurn(onEvent);
         }
       };
 
@@ -2262,7 +2288,14 @@ export class CursorExecutor extends BaseExecutor {
     // the conversation (new ID) so Cursor replays from client history.
     const runWithRetry = async (onEvent) => {
       outputStarted = false;
-      const wrapped = makeWrappedEvent(onEvent);
+      let heldErrorEvent = null;
+      const wrapped = makeWrappedEvent((event) => {
+        // Hold error events until the retry decision: a recovered attempt's
+        // output must reach the client without an intervening terminal error
+        // frame closing the stream (upstream turnError parity).
+        if (event.type === "error") { heldErrorEvent = event; return; }
+        onEvent(event);
+      });
       let attempt = 0;
       for (;;) {
         try {
@@ -2277,6 +2310,7 @@ export class CursorExecutor extends BaseExecutor {
           }
           conv.emptyStreak = 0;
           commitConversationTurn(conv, userTexts);
+          if (heldErrorEvent && !result.sawContent && !outputStarted) onEvent(heldErrorEvent);
           return result;
         } catch (error) {
           const hint = error.retryHint || classifyCursorError(error.message);
@@ -2286,8 +2320,10 @@ export class CursorExecutor extends BaseExecutor {
               conv.emptyStreak = (conv.emptyStreak || 0) + 1;
               const exhausted = new Error("context_exhausted");
               exhausted.retryHint = "context_exhausted";
+              if (heldErrorEvent && !outputStarted) onEvent(heldErrorEvent);
               throw exhausted;
             }
+            if (heldErrorEvent && !outputStarted) onEvent(heldErrorEvent);
             throw error;
           }
           attempt++;
@@ -2327,15 +2363,17 @@ export class CursorExecutor extends BaseExecutor {
     if (stream === false) {
       let content = "";
       let reasoning = "";
-      let toolCall = null;
+      const toolCalls = [];
       let agentError = null;
       // Connection/stream failures propagate (reject) so callers treat them as
       // transport errors; only agent-level protocol errors become BAD_REQUEST.
       await runWithRetry((event) => {
-        if (event.type === "text") content += event.value;
-        else if (event.type === "thinking") reasoning += event.value;
-        else if (event.type === "tool_call") toolCall = event.value;
-        else if (event.type === "error") agentError = event.value;
+        if (event.type === "text") { content += event.value; agentError = null; }
+        else if (event.type === "thinking") { reasoning += event.value; agentError = null; }
+        else if (event.type === "tool_call") { toolCalls.push(event.value); agentError = null; }
+        else if (event.type === "error" && !content && !reasoning && !toolCalls.length) agentError = event.value;
+        // An error from a superseded attempt is cleared by later successful
+        // output; the retry loop's final attempt decides the envelope.
       });
       if (agentError) {
         return {
@@ -2363,7 +2401,7 @@ export class CursorExecutor extends BaseExecutor {
               ...(reasoning ? { reasoning_content: reasoning } : {}),
               ...(toolCalls.length ? { tool_calls: toolCalls } : {}),
             },
-            finish_reason: finishReason,
+            finish_reason: toolCalls.length ? "tool_calls" : "stop",
           }],
           usage: buildAgentUsage(content.length),
         }), { headers: { "Content-Type": "application/json" } }),

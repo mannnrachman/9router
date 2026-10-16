@@ -269,3 +269,10 @@ const assistantCleanup = setInterval(() => {
     }
 }, MEMORY_CONFIG.sessionCleanupIntervalMs);
 if (assistantCleanup.unref) assistantCleanup.unref();
+
+/** Test hook: clear all runtime session stores so suites don't share state. */
+export function __resetSessionStoresForTest() {
+    runtimeSessionStore.clear();
+    assistantSessionStore.clear();
+    continuationStore.clear();
+}

@@ -166,7 +166,7 @@ function parseModelVariant(payload) {
  * canonical ID used by AgentService; legacy slugs and variant strings are
  * retained so callers can translate user-facing model IDs before Run.
  */
-export function parseCursorAvailableModels(payload) {
+export function parseCursorCatalogModels(payload) {
   const response = decodeMessage(payload);
   const seen = new Set();
   const models = [];
@@ -277,23 +277,6 @@ export function expandCursorModelAliases(models) {
  * Resolve a static/legacy model slug to the canonical AgentService model ID
  * and the exact parameter values selected by Cursor's model picker.
  */
-// Auto (server picks) is not a real AgentService model id — resolve it to the
-// account's default agent-capable model so Run is not rejected with an empty
-// turn. Prefer defaultOn, fall back to the first usable agent model.
-function resolveAutoModelSelection(models) {
-  if (!Array.isArray(models) || models.length === 0) return null;
-  const usable = models.filter((model) => model.supportsAgent && !model.isChatOnly && !model.isHidden);
-  if (usable.length === 0) return null;
-  const preferred = usable.find((model) => model.defaultOn) || usable[0];
-  return {
-    modelId: preferred.id,
-    parameters: [],
-    maxMode: false,
-    builtInModel: true,
-    isVariantStringRepresentation: false,
-    matchedBy: "auto-default",
-  };
-}
 
 export function resolveCursorModelSelection(models, requestedModel) {
   const requested = typeof requestedModel === "string" ? requestedModel.trim() : "";
@@ -443,7 +426,7 @@ async function fetchCursorCatalog(credentials, options = {}) {
     throw error;
   }
 
-  return parseCursorAvailableModels(new Uint8Array(response.body));
+  return parseCursorCatalogModels(new Uint8Array(response.body));
 }
 
 /**
@@ -477,6 +460,19 @@ export function resolveAutoModelSelection(models) {
  * auto/default entry. Only mutates when the server sent field 2, keeping the
  * parsed shape backward compatible. (upstream v0.5.104)
  */
+// Upstream-compatible picker-flags decode: flat {id, defaultOn, isChatOnly,
+// supportsAgent, isHidden} entries merged onto the usable-models list.
+export function parseCursorAvailableModels(payload) {
+  const catalog = parseCursorCatalogModels(payload);
+  return catalog.map(({ id, defaultOn, isChatOnly, supportsAgent, isHidden }) => ({
+    id,
+    defaultOn,
+    isChatOnly,
+    supportsAgent,
+    isHidden,
+  }));
+}
+
 export function mergeCursorModelFlags(models, payload) {
   const available = parseCursorAvailableModels(payload);
   if (!available.length || !Array.isArray(models)) return models;

@@ -73,6 +73,7 @@ vi.mock("open-sse/config/runtimeConfig.js", async (importOriginal) => {
 });
 vi.mock("open-sse/translator/formats.js", () => ({
   detectFormatByEndpoint: vi.fn(() => null),
+  FORMATS: { OPENAI: "openai", CLAUDE: "claude", OPENAI_RESPONSES: "openai_responses" },
 }));
 vi.mock("@/sse/utils/logger.js", () => ({
   debug: vi.fn(),
@@ -142,6 +143,7 @@ describe("chat no-auth proxy fallback", () => {
     expect(mocks.getProviderCredentials).toHaveBeenCalledTimes(2);
     expect(mocks.getProviderCredentials.mock.calls[1][3]).toEqual({
       excludeProxyPoolIds: new Set(["pool-a"]),
+      requestedModel: "deepseek-v4-flash-free",
     });
     expect(mocks.markAccountUnavailable).toHaveBeenCalledWith(
       "noauth",
@@ -219,6 +221,7 @@ describe("chat no-auth proxy fallback", () => {
       expect.stringContaining("429 from pool-b"),
       "2026-08-13T00:00:10.000Z",
       "reset after 10s",
+      expect.anything(),
     );
   });
 });

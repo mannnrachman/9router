@@ -1,6 +1,13 @@
 import { afterEach, describe, it, expect, vi } from "vitest";
 
-import { CursorExecutor, resolveCursorAgentModel, splitMessagesIntoTurns, buildTurnsTranscript } from "../../open-sse/executors/cursor.js";
+import { CursorExecutor, resolveCursorAgentModel, splitMessagesIntoTurns, buildTurnsTranscript, __resetCursorAgentStateForTest } from "../../open-sse/executors/cursor.js";
+import { __resetSessionStoresForTest } from "../../open-sse/utils/sessionManager.js";
+
+afterEach(() => {
+  __resetCursorAgentStateForTest();
+  __resetSessionStoresForTest();
+});
+
 import {
   decodeMessage,
   encodeAgentValue,
@@ -54,9 +61,35 @@ function turnEndFrame() {
   return Buffer.from(wrapConnectRPCFrame(encodeField(1, LEN, update)));
 }
 
+// Upstream name for the same frame.
+const turnEndedFrame = () => turnEndFrame();
+
 // AgentServerMessage field 3 = conversation_checkpoint_update (opaque bytes).
 function checkpointFrame(bytes) {
   return Buffer.from(wrapConnectRPCFrame(encodeField(3, LEN, bytes)));
+}
+
+// AgentServerMessage field 4 = KvServerMessage set_blob (variant 3).
+function kvSetFrame(blobId, blobData, id = 1) {
+  const setArgs = Buffer.concat([
+    Buffer.from(encodeField(1, LEN, blobId)),
+    Buffer.from(encodeField(2, LEN, blobData)),
+  ]);
+  const kv = Buffer.concat([
+    Buffer.from(encodeField(1, VARINT, id)),
+    Buffer.from(encodeField(3, LEN, setArgs)),
+  ]);
+  return Buffer.from(wrapConnectRPCFrame(encodeField(4, LEN, kv)));
+}
+
+// AgentServerMessage field 4 = KvServerMessage get_blob (variant 2).
+function kvGetFrame(blobId, id = 1) {
+  const getArgs = Buffer.from(encodeField(1, LEN, blobId));
+  const kv = Buffer.concat([
+    Buffer.from(encodeField(1, VARINT, id)),
+    Buffer.from(encodeField(2, LEN, getArgs)),
+  ]);
+  return Buffer.from(wrapConnectRPCFrame(encodeField(4, LEN, kv)));
 }
 
 function stubAgentSession(executor, frames) {
@@ -226,7 +259,11 @@ describe("CursorExecutor AgentService exec_request handling", () => {
       model: "gpt-5.2", body: { messages: [{ role: "user", content: "hi" }] },
       stream: true, credentials,
     });
-    await expect(response.text()).rejects.toThrow("transport interrupted");
+    // Fork semantics: transport failures surface as an SSE error frame (never a
+    // successful completion), not a rejected Response body.
+    const text = await response.text();
+    expect(text).toContain("transport interrupted");
+    expect(text).not.toContain('"finish_reason":"stop"');
     expect(written).toHaveLength(1);
   });
   it("acknowledges a request-context exec request without ending the turn", async () => {
@@ -607,9 +644,11 @@ describe("CursorExecutor AgentService exec_request handling", () => {
       stream: true,
     });
 
+    // The SSE response is consumed lazily; drain it so the ack is flushed.
+    const drained = await result.response.text();
     expect(written.length).toBe(2);
     expect(written[1].toString("utf8")).not.toContain("read_file");
-    const content = parseSSE(await result.response.text())
+    const content = parseSSE(drained)
       .map((e) => e.choices?.[0]?.delta?.content || "")
       .join("");
     expect(content).toBe("hello");
@@ -643,7 +682,7 @@ describe("CursorExecutor AgentService exec_request handling", () => {
 
   it("returns a non-200 error body for an unsupported exec request when not streaming", async () => {
     const { result } = await runAgent({
-      frames: [execRequestFrame(2)],
+      frames: [execRequestFrame(11)],
       stream: false,
     });
 
@@ -734,8 +773,10 @@ describe("Cursor long-session empty-turn recovery", () => {
     // Consumption (and therefore the retry) is lazy: drain the stream first.
     const text = await result.response.text();
     expect(writtenPerAttempt).toHaveLength(2);
-    // First attempt replays full history; the retry ships a tail-only frame.
-    expect(runFrameHasHistory(writtenPerAttempt[0][0])).toBe(true);
+    // Fork semantics: sessions at/above CURSOR_MSG_COMPACT_THRESHOLD (80) are
+    // tail-only from the FIRST attempt (upstream replays full history first);
+    // the retry stays tail-only as well.
+    expect(runFrameHasHistory(writtenPerAttempt[0][0])).toBe(false);
     expect(runFrameHasHistory(writtenPerAttempt[1][0])).toBe(false);
 
     const events = parseSSE(text);
