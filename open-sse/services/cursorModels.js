@@ -450,6 +450,43 @@ async function fetchCursorCatalog(credentials, options = {}) {
  * Resolve the live Cursor catalog for the authenticated account.
  * Returns null on any failure so callers can fall back to static models.
  */
+
+/**
+ * "Auto (Server Picks)" / "default" is not a real AgentService model id —
+ * sending it verbatim makes Run come back empty. Resolve it to the account's
+ * default agent-capable model so the server picks like the IDE does. Prefers
+ * the picker's defaultOn model, then the first usable agent model.
+ * (upstream v0.5.104; works on both the fork's full catalog entries — which
+ * carry supportsAgent/defaultOn from AvailableModels — and upstream's
+ * flag-merged usable list.)
+ */
+export function resolveAutoModelSelection(models) {
+  if (!Array.isArray(models) || models.length === 0) return null;
+  const usable = models.filter((model) => model.supportsAgent && !model.isChatOnly && !model.isHidden);
+  if (usable.length === 0) return null;
+  const preferred = usable.find((model) => model.defaultOn) || usable[0];
+  return {
+    modelId: preferred.id,
+    matchedBy: "auto-default",
+  };
+}
+
+/**
+ * Attach model-picker flags (supportsAgent/defaultOn/…) from the response's
+ * AvailableModels onto the usable-models list so callers can resolve the
+ * auto/default entry. Only mutates when the server sent field 2, keeping the
+ * parsed shape backward compatible. (upstream v0.5.104)
+ */
+export function mergeCursorModelFlags(models, payload) {
+  const available = parseCursorAvailableModels(payload);
+  if (!available.length || !Array.isArray(models)) return models;
+  const flagsById = new Map(available.map((model) => [model.id, model]));
+  return models.map((model) => {
+    const flags = flagsById.get(model.id);
+    return flags ? { ...model, ...flags } : model;
+  });
+}
+
 export async function resolveCursorModels(credentials, options = {}) {
   if (!credentials?.accessToken || !credentials?.providerSpecificData?.machineId) {
     options.log?.debug?.("CURSOR_MODELS", "No Cursor access token or machine ID; skipping live fetch");

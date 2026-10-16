@@ -6,10 +6,12 @@ import {
   encodeField,
   wrapConnectRPCFrame,
   decodeMessage,
+  parseConnectRPCFrame,
   extractTextFromResponse,
   encodeMcpToolDefinition,
   encodeMcpTools,
   encodeMcpResultSuccess,
+  decodeMcpArgs,
   decodeExecServerEvent,
   encodeAgentNativeRejection,
   encodeAgentEmptyListMcpResources,
@@ -31,6 +33,7 @@ import {
   encodeAgentShellTimeout,
 } from "../utils/cursorProtobuf.js";
 import { buildCursorHeaders } from "../utils/cursorChecksum.js";
+import { resolveCursorModels, resolveAutoModelSelection } from "../services/cursorModels.js";
 import { estimateUsage } from "../utils/usageTracking.js";
 import { SSE_DONE, SSE_HEADERS } from "../utils/sseConstants.js";
 import { chatChunkSse, sseChunk } from "../utils/sse.js";
@@ -394,6 +397,7 @@ function handleNativeExec(execEvent, session) {
   return true;
 }
 import crypto from "node:crypto";
+import { ROLE, OPENAI_BLOCK } from "../translator/schema/index.js";
 
 // Detect cloud environment
 const isCloudEnv = () => {
@@ -1050,23 +1054,29 @@ function textFromContent(content) {
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return "";
   return content
-    .filter((part) => part?.type === "text" && typeof part.text === "string")
+    .filter((part) => part?.type === OPENAI_BLOCK.TEXT && typeof part.text === "string")
     .map((part) => part.text)
     .join("\n");
 }
 
+function isTextPart(part) {
+  return !part || part.type === OPENAI_BLOCK.TEXT || typeof part === "string";
+}
+
 export function isAgentCapableRequest(body) {
-  // Many compatible clients always attach their built-in tool schemas, even
-  // for a normal text turn. Cursor's retired ChatService rejects those
-  // requests. AgentService accepts text history, declared MCP tools, and prior
-  // tool calls/results reconstructed as conversation text.
-  return Array.isArray(body?.messages) && body.messages.length > 0 && body.messages.every((message) => {
-    if (!["system", "user", "assistant", "tool"].includes(message?.role)) return false;
-    const textContent = typeof message?.content === "string"
-      || message?.content == null
-      || Array.isArray(message?.content) && message.content.every((part) => part?.type === "text" && typeof part.text === "string");
-    if (!textContent) return false;
-    if (message.role === "assistant" && message.tool_calls != null && !Array.isArray(message.tool_calls)) return false;
+  // ChatService rejects auto/composer and most thinking variants. AgentService
+  // can answer text turns (including declared tool schemas) and tool-call
+  // history. Image parts still need the legacy protobuf path.
+  // (fork) The "tool" role is accepted so reconstructed tool results can ride
+  // along as conversation text; assistant tool_calls must be arrays.
+  if (!Array.isArray(body?.messages) || body.messages.length === 0) return false;
+  return body.messages.every((message) => {
+    if (Array.isArray(message?.content)) {
+      if (!message.content.every(isTextPart)) return false;
+    } else if (!(message?.content == null || typeof message.content === "string")) {
+      return false;
+    }
+    if (message?.role === "assistant" && message.tool_calls != null && !Array.isArray(message.tool_calls)) return false;
     return true;
   });
 }
@@ -1108,22 +1118,24 @@ function toolResultsFromMessage(message) {
 }
 
 function encodeHistoryMessage(message) {
-  const rawContent = textFromContent(message?.content);
-  const content = message?.role === "tool"
-    ? capCursorToolResult(rawContent)
-    : capCursorToolXml(rawContent);
-  const contentParts = [content];
-  if (message?.role === "assistant") contentParts.push(toolCallsFromMessage(message));
-  if (message?.role === "assistant") contentParts.push(toolResultsFromMessage(message));
-  if (message?.role === "tool") {
-    contentParts.unshift(`[Tool result ${message.tool_call_id || ""}${message.name ? ` (${message.name})` : ""}]`);
+  const content = textFromContent(message?.content);
+  const extras = [];
+  if (message?.role === ROLE.ASSISTANT && message.tool_calls?.length) {
+    for (const tc of message.tool_calls) {
+      extras.push(`[tool_call id=${tc.id || ""} name=${tc.function?.name || "tool"} args=${tc.function?.arguments || "{}"}]`);
+    }
   }
-  const encodedContent = contentParts.filter(Boolean).join("\n");
-  if (!encodedContent) return null;
+  if (message?.role === ROLE.TOOL) {
+    extras.push(`[tool_result id=${message.tool_call_id || ""}${message.name ? ` (${message.name})` : ""}]`);
+  }
+  if (message?.role === ROLE.ASSISTANT) extras.push(toolResultsFromMessage(message));
+  const capped = message?.role === ROLE.TOOL ? capCursorToolResult(content) : capCursorToolXml(content);
+  const textBody = [capped, ...extras.filter(Boolean)].filter(Boolean).join("\n");
+  if (!textBody) return null;
 
   // ConversationHistoryMessage.user / .assistant -> repeated content -> text.
-  const text = agentString(1, encodedContent);
-  if (message.role === "assistant") {
+  const text = agentString(1, textBody);
+  if (message.role === ROLE.ASSISTANT) {
     return agentMessage(2, agentMessage(1, agentMessage(1, text)));
   }
   return agentMessage(1, agentMessage(1, agentMessage(1, text)));
@@ -1138,8 +1150,10 @@ export function foldSystemIntoUserMessage(system, userText) {
 }
 
 export function buildAgentRunFrame(messages, model, tools = [], modelSelection = null, reasoningEffort = null, resume = null, { omitTools = false } = {}) {
-  // resume = { conversationId, checkpoint, blobStore } — continue stored state
-  // instead of replaying the whole history as fresh context.
+  // custom_system_prompt (RunRequest field 8) makes AgentService return an
+  // empty turn. Fold system text into the current user message instead.
+  // resume = { conversationId, checkpoint, blobStore } (fork) — continue stored
+  // state instead of replaying the whole history as fresh context.
   const blobStore = resume?.blobStore || null;
   let conversationState = resume?.checkpoint || null;
   const conversationId = resume?.conversationId || null;
@@ -1149,12 +1163,12 @@ export function buildAgentRunFrame(messages, model, tools = [], modelSelection =
   }
   if (!conversationState) messages = compactCursorMessages(messages, model, tools, contextWindow);
   const system = messages
-    .filter((message) => message?.role === "system")
+    .filter((message) => message?.role === ROLE.SYSTEM)
     .map((message) => textFromContent(message.content))
     .filter(Boolean)
     .join("\n\n");
-  const chatMessages = messages.filter((message) => message?.role !== "system");
-  const currentIndex = [...chatMessages].map((message) => message?.role).findLastIndex((role) => role === "user" || role === "tool");
+  const chatMessages = messages.filter((message) => message?.role !== ROLE.SYSTEM);
+  const currentIndex = [...chatMessages].map((message) => message?.role).findLastIndex((role) => role === ROLE.USER || role === ROLE.TOOL);
   const current = currentIndex >= 0 ? chatMessages[currentIndex] : chatMessages.at(-1);
   const priorMessages = chatMessages.slice(0, currentIndex >= 0 ? currentIndex : -1);
 
@@ -1198,7 +1212,7 @@ export function buildAgentRunFrame(messages, model, tools = [], modelSelection =
     ? priorMessages.map(encodeHistoryMessage).filter(Boolean)
     : [];
   const rawCurrentText = textFromContent(current?.content);
-  const currentText = current?.role === "tool"
+  const currentText = current?.role === ROLE.TOOL
     ? [`[Tool result ${current.tool_call_id || ""}${current.name ? ` (${current.name})` : ""}]`, capCursorToolResult(rawCurrentText)].filter(Boolean).join("\n")
     : capCursorToolXml(rawCurrentText);
   const userText = foldSystemIntoUserMessage(system, currentText);
@@ -1221,7 +1235,7 @@ export function buildAgentRunFrame(messages, model, tools = [], modelSelection =
   );
   const conversationAction = agentMessage(1, userAction);
   const requestedModel = encodeRequestedAgentModel(model, modelSelection, reasoningEffort);
-  // ModelDetails (field 3). Thinking variants (Composer, Grok, *-thinking)
+  // ModelDetails (field 3): thinking variants (Composer, Grok, *-thinking)
   // return an empty turn when only RequestedModel (field 9) is set.
   const modelId = modelSelection?.modelId || model;
   const modelDetails = concatBuffers(
@@ -1229,12 +1243,13 @@ export function buildAgentRunFrame(messages, model, tools = [], modelSelection =
     agentString(3, modelId),
     agentString(4, modelId),
   );
+  const mcpTools = encodeMcpTools(tools);
   const runRequest = concatBuffers(
     // An empty ConversationStateStructure starts a fresh local agent session.
     agentMessage(1, conversationState || new Uint8Array()),
     agentMessage(2, conversationAction),
     agentMessage(3, modelDetails),
-    ...(omitTools || !tools.length ? [] : [agentMessage(4, encodeMcpTools(tools))]),
+    ...(omitTools || !mcpTools.length ? [] : [agentMessage(4, mcpTools)]),
     ...(conversationId ? [agentString(5, conversationId)] : []),
     agentMessage(9, requestedModel),
   );
@@ -1282,43 +1297,74 @@ function decodeAgentFrames(buffer, onFrame) {
   return pending;
 }
 
-function createRequestContextResponse(execRequest, tools = []) {
-  // AgentService asks every run for client context. 9router has no IDE file
-  // context, so acknowledge with an empty RequestContext.
-  const requestContext = tools.length
-    ? concatBuffers(...tools.map((tool) => agentMessage(7, encodeMcpToolDefinition(tool))))
-    : new Uint8Array();
-  const requestContextSuccess = agentMessage(1, requestContext);
+function execIds(execRequest) {
+  const id = Number(execRequest?.get(1)?.[0]?.value || 0);
+  const execId = extractAgentString(execRequest, 15);
+  return { id, execId };
+}
+
+function wrapExecClientMessage(execMsgId, execId, resultField, resultPayload) {
+  const parts = [];
+  if (execMsgId) parts.push(encodeField(1, PROTOBUF_VARINT, execMsgId));
+  parts.push(agentString(15, execId || ""));
+  parts.push(encodeField(resultField, PROTOBUF_LEN, resultPayload || new Uint8Array()));
+  return wrapConnectRPCFrame(agentMessage(2, concatBuffers(...parts)));
+}
+
+function createRequestContextResponse(execRequest) {
+  // Tools already go out on AgentRunRequest.mcp_tools. Echoing them again on
+  // this ack makes AgentService stall silently (0 SSE bytes until abort).
+  const { id, execId } = execIds(execRequest);
+  const requestContextSuccess = agentMessage(1, new Uint8Array());
   const requestContextResult = agentMessage(1, requestContextSuccess);
-  const execClientMessage = concatBuffers(
-    ...(extractAgentVarint(execRequest, 1) != null ? [encodeField(1, PROTOBUF_VARINT, extractAgentVarint(execRequest, 1))] : []),
-    agentMessage(10, requestContextResult),
-    ...(execRequest?.has(15) ? [agentMessage(15, execRequest.get(15)[0].value)] : []),
-  );
-  return wrapConnectRPCFrame(agentMessage(2, execClientMessage));
+  return wrapExecClientMessage(id, execId, 10, requestContextResult);
 }
 
-function createListMcpResourcesResponse(execRequest) {
-  // 9router exposes callable MCP tools, but it has no Cursor MCP resource
-  // catalogue. Return a successful empty list so the agent can continue.
-  const result = agentMessage(1, new Uint8Array());
-  const execClientMessage = concatBuffers(
-    ...(extractAgentVarint(execRequest, 1) != null ? [encodeField(1, PROTOBUF_VARINT, extractAgentVarint(execRequest, 1))] : []),
-    agentMessage(17, result),
-    ...(execRequest?.has(15) ? [agentMessage(15, execRequest.get(15)[0].value)] : []),
-  );
-  return wrapConnectRPCFrame(agentMessage(2, execClientMessage));
+// ExecServerMessage variant → ExecClientMessage result field (same numbers).
+const EXEC_RESULT_FIELD = {
+  2: 2, 3: 3, 4: 4, 5: 5, 7: 7, 8: 8, 9: 9, 16: 16, 20: 20, 23: 23,
+};
+
+function rejectExecRequest(execRequest) {
+  const { id, execId } = execIds(execRequest);
+  const variant = [...(execRequest?.keys?.() || [])].find((field) => field !== 1 && field !== 15);
+  const resultField = EXEC_RESULT_FIELD[variant];
+  if (!resultField) return null;
+  // Diagnostics has no rejected variant — empty success unblocks the stream.
+  if (variant === 9) return wrapExecClientMessage(id, execId, 9, new Uint8Array());
+  const rejected = agentMessage(2, agentString(2, "Tool not available in this environment. Use the MCP tools provided instead."));
+  return wrapExecClientMessage(id, execId, resultField, rejected);
 }
 
-function createMcpResultResponse(pending, content, isError = false) {
-  const mcpResult = encodeMcpResultSuccess({ textItems: [capCursorToolResult(content)], isError });
-  const execClientMessage = concatBuffers(
-    ...(pending.id != null ? [encodeField(1, PROTOBUF_VARINT, pending.id)] : []),
-    agentMessage(11, mcpResult),
-    ...(pending.execId ? [agentMessage(15, pending.execId)] : []),
-  );
-  return wrapConnectRPCFrame(agentMessage(2, execClientMessage));
+export function encodeKvClientMessage(kvId, resultField, resultPayload, metadata) {
+  const parts = [];
+  if (kvId) parts.push(encodeField(1, PROTOBUF_VARINT, kvId));
+  parts.push(encodeField(resultField, PROTOBUF_LEN, resultPayload || new Uint8Array()));
+  if (metadata && metadata.length) parts.push(encodeField(4, PROTOBUF_LEN, metadata));
+  return wrapConnectRPCFrame(agentMessage(3, concatBuffers(...parts)));
 }
+
+// The AgentService h2 path bypasses proxyAwareFetch (Node http2 duplex, no
+// dispatcher), so the strict-proxy guarantee that proxyFetch enforces for
+// regular fetch never applies here. Until h2 proxying lands (see #3276),
+// honor just the policy side: when a proxy is intended AND strict AND cannot
+// be resolved for this request, fail closed instead of silently opening a
+// direct socket that exposes the host's real IP — the exact leak strict mode
+// exists to prevent (#4333). Non-strict callers keep today's direct behavior.
+const proxyIntentFailed = (proxyOptions) => {
+  if (proxyOptions?.strictProxy !== true) return false;
+  const proxyIntended = Boolean(
+    proxyOptions?.proxyPoolId
+    || proxyOptions?.enabled === true
+    || proxyOptions?.connectionProxyEnabled === true
+    || (proxyOptions?.url || proxyOptions?.connectionProxyUrl || "").trim().length > 0,
+  );
+  if (!proxyIntended) return false;
+  // A vercel/cloudflare-style relay rides on plain fetch, not this h2 path.
+  if (proxyOptions?.vercelRelayUrl) return false;
+  // Proxy intended and strict: the h2 transport below cannot carry it.
+  return true;
+};
 
 const CURSOR_STREAM_DEBUG = process.env.CURSOR_STREAM_DEBUG === "1";
 const CURSOR_TRACE_CONTENT = process.env.CURSOR_TRACE_CONTENT === "1";
@@ -1455,6 +1501,57 @@ function createErrorResponse(jsonError) {
     status: isRateLimit ? HTTP_STATUS.RATE_LIMITED : HTTP_STATUS.BAD_REQUEST,
     headers: { "Content-Type": "application/json" }
   });
+}
+
+// Long-session empty-turn recovery: Cursor occasionally answers a long
+// history replay with HTTP 200 and zero deltas (empty turn). One retry on a
+// tail-only frame recovers the session instead of failing the client turn.
+const CURSOR_EMPTY_TURN_MAX_RETRIES = (() => {
+  const value = Number(process.env.CURSOR_EMPTY_TURN_MAX_RETRIES);
+  return Number.isFinite(value) && value >= 0 ? Math.floor(value) : 1;
+})();
+
+const CURSOR_TAIL_ONLY_THRESHOLD = (() => {
+  const value = Number(process.env.CURSOR_TAIL_ONLY_THRESHOLD);
+  return Number.isFinite(value) && value > 0 ? Math.floor(value) : 80;
+})();
+
+const CURSOR_EMPTY_TURN_RETRY_DELAY_MS = (() => {
+  const value = Number(process.env.CURSOR_EMPTY_TURN_RETRY_DELAY_MS);
+  return Number.isFinite(value) && value >= 0 ? Math.floor(value) : 400;
+})();
+
+/** Minimal tail for wedged long sessions — drops bulk history and tool XML. */
+export function tailOnlyCursorMessages(messages) {
+  if (!Array.isArray(messages) || messages.length === 0) return messages || [];
+  const systemMessages = messages.filter(
+    (message) => message?.role === ROLE.SYSTEM && !String(message?.content || "").includes("[9router]"),
+  );
+  const chatMessages = messages.filter((message) => message?.role !== ROLE.SYSTEM);
+  let anchor = chatMessages.length - 1;
+  for (let i = chatMessages.length - 1; i >= 0; i--) {
+    if (chatMessages[i]?.role === ROLE.USER || chatMessages[i]?.role === ROLE.TOOL) {
+      anchor = i;
+      break;
+    }
+  }
+  const tailStart = anchor > 0 && chatMessages[anchor - 1]?.role === ROLE.ASSISTANT ? anchor - 1 : anchor;
+  const tail = chatMessages.slice(Math.max(0, tailStart));
+  const note = {
+    role: ROLE.SYSTEM,
+    content: `[9router] Long session: ${messages.length} messages trimmed to the latest turn. Answer the current request; re-read files if needed.`,
+  };
+  return [...systemMessages, note, ...tail];
+}
+
+/**
+ * Retry an empty AgentService turn only when a long-session replay is the
+ * likely cause: upstream accepts the request, streams HTTP 200, and closes
+ * with zero deltas. A first-message empty turn is a protocol condition, not
+ * a wedged replay, and must surface to the client without retry.
+ */
+function shouldRetryEmptyTurn(messageCount) {
+  return messageCount >= CURSOR_TAIL_ONLY_THRESHOLD;
 }
 
 export class CursorExecutor extends BaseExecutor {
@@ -1700,14 +1797,29 @@ export class CursorExecutor extends BaseExecutor {
       resyncConversationLineageAfterCompact(conv, userTexts);
     }
 
+
+    // "Auto (Server Picks)" / "default" is a picker alias, not an AgentService
+    // model id — sending it verbatim yields an empty turn (upstream). Resolve it
+    // to the account's default agent-capable model from the live catalog first;
+    // the strict catalog resolution below still runs for canonical variants.
+    let runModel = model;
+    if ((model === "default" || model === "auto") && modelCatalog === undefined) {
+      const catalog = await resolveCursorModels(credentials, { signal, log });
+      const selection = resolveAutoModelSelection(catalog?.models);
+      if (selection) {
+        log?.info?.("CURSOR", `auto model resolved: ${model} → ${selection.modelId} (${selection.matchedBy})`);
+        runModel = selection.modelId;
+      }
+    }
+
     const reasoningEffort = body.reasoning_effort || body.reasoning?.effort || null;
-    const agentModel = resolveCursorAgentModel(model);
+    const agentModel = resolveCursorAgentModel(runModel);
     if (agentModel !== model) {
       debugLog(`[CURSOR AGENT ${runId}] resolved model ${model} → ${agentModel}`);
     }
 
     const modelSelection = modelCatalog !== undefined
-      ? resolveCursorModelSelection(modelCatalog, model)
+      ? resolveCursorModelSelection(modelCatalog, runModel)
       : shouldResolveCursorModel(model)
         ? await resolveCursorModel(credentials, model, { signal: requestController.signal, log, proxyOptions })
         : null;
@@ -1796,12 +1908,36 @@ export class CursorExecutor extends BaseExecutor {
       const resumedFromCheckpoint = Boolean(conv.checkpoint?.length);
       let session;
       let responseHeaders;
+      // Composer visible-answer tracking (upstream): thinking_delta may carry
+      // the whole answer after </think> when text_delta never arrives.
+      let thinkingAcc = "";
+      let emittedVisible = 0;
+      let sawText = false;
+      const composerModel = isComposerModel(runModel);
       const closeRetainedOnAbort = () => {
         if (retainedState) closeRetainedAgentSession(retainedState);
       };
       if (requestController.signal.aborted) closeRetainedOnAbort();
       else requestController.signal.addEventListener("abort", closeRetainedOnAbort, { once: true });
       traceLog(runId, `tool_results=${JSON.stringify(toolResults)} retained=${Boolean(retainedState)}`);
+      // flushThinkingFallback + finishTurn (upstream): a thinking-only turn must
+      // still surface visible composer content instead of an empty turn error.
+      const flushThinkingFallback = (onEvent) => {
+        if (sawText || !thinkingAcc) return;
+        const fallback = composerModel
+          ? visibleComposerContentFromThinking(thinkingAcc)
+          : thinkingAcc.trim();
+        if (fallback) {
+          sawText = true;
+          onEvent({ type: "text", value: fallback });
+        }
+      };
+      const finishTurn = (onEvent) => {
+        flushThinkingFallback(onEvent);
+        finished = true;
+        if (sawText) onEvent({ type: "done" });
+        else onEvent({ type: "error", value: "Cursor AgentService returned an empty turn" });
+      };
       try {
         if (requestController.signal.aborted) throw new Error("Request aborted");
         if (retainedState) {
@@ -1963,7 +2099,19 @@ export class CursorExecutor extends BaseExecutor {
                     // Count thinking even when not forwarded (Claude Code UA) so
                     // thinking-only turns are not misclassified as empty_turn.
                     sawContent = true;
+                    thinkingAcc += thinkingDelta;
                     if (forwardThinking) onEvent({ type: "thinking", value: thinkingDelta });
+                    // Composer (and some Grok variants) put the visible answer
+                    // after </think> here and never send text_delta (upstream).
+                    if (composerModel) {
+                      const visible = visibleComposerContentFromThinking(thinkingAcc);
+                      if (visible.length > emittedVisible) {
+                        const deltaContent = visible.slice(emittedVisible);
+                        emittedVisible = visible.length;
+                        sawText = true;
+                        onEvent({ type: "text", value: deltaContent });
+                      }
+                    }
                   }
                 }
                 if (update.has(8)) {
@@ -1974,8 +2122,7 @@ export class CursorExecutor extends BaseExecutor {
                   } catch {}
                 }
                 if (update.has(14)) {
-                  finished = true;
-                  onEvent({ type: "done" });
+                  finishTurn();
                   return false;
                 }
               }
@@ -2096,12 +2243,12 @@ export class CursorExecutor extends BaseExecutor {
             err.retryHint = "timeout";
             throw err;
           }
-          if (!finished && !timedOut) onEvent({ type: "done" });
+          if (!finished && !timedOut) finishTurn(onEvent);
         }
       };
 
       await consume();
-      return { keepSessionOpen, retainedState, sawContent, resumedFromCheckpoint };
+      return { keepSessionOpen, retainedState, sawContent: sawContent || sawText, sawText, resumedFromCheckpoint };
     };
 
     // Wrap events so we can refuse to retry once real output has started.
@@ -2214,9 +2361,9 @@ export class CursorExecutor extends BaseExecutor {
               role: "assistant",
               content: content || null,
               ...(reasoning ? { reasoning_content: reasoning } : {}),
-              ...(toolCall ? { tool_calls: [toolCall] } : {}),
+              ...(toolCalls.length ? { tool_calls: toolCalls } : {}),
             },
-            finish_reason: toolCall ? "tool_calls" : "stop",
+            finish_reason: finishReason,
           }],
           usage: buildAgentUsage(content.length),
         }), { headers: { "Content-Type": "application/json" } }),
@@ -2347,9 +2494,8 @@ export class CursorExecutor extends BaseExecutor {
       responseFormat: FORMATS.OPENAI,
     };
   }
-
   async execute({ model, body, stream, credentials, signal, log, proxyOptions = null, modelCatalog }) {
-    if (isAgentTextRequest(body)) {
+    if (isAgentCapableRequest(body)) {
       try {
         return await this.executeAgent({ model, body, stream, credentials, signal, log, proxyOptions, modelCatalog });
       } catch (error) {

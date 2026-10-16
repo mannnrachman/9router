@@ -7,7 +7,6 @@ import {
   encodeField,
   wrapConnectRPCFrame,
 } from "../../open-sse/utils/cursorProtobuf.js";
-
 const VARINT = 0;
 const LEN = 2;
 
@@ -58,29 +57,6 @@ function turnEndFrame() {
 // AgentServerMessage field 3 = conversation_checkpoint_update (opaque bytes).
 function checkpointFrame(bytes) {
   return Buffer.from(wrapConnectRPCFrame(encodeField(3, LEN, bytes)));
-}
-
-// AgentServerMessage field 4 = kvServerMessage { id, get_blob_args { blob_id } }.
-function kvGetFrame(blobId, id = 1) {
-  const getArgs = Buffer.from(encodeField(1, LEN, blobId));
-  const kv = Buffer.concat([
-    Buffer.from(encodeField(1, VARINT, id)),
-    Buffer.from(encodeField(2, LEN, getArgs)),
-  ]);
-  return Buffer.from(wrapConnectRPCFrame(encodeField(4, LEN, kv)));
-}
-
-// AgentServerMessage field 4 = kvServerMessage { id, set_blob_args { blob_id, blob_data } }.
-function kvSetFrame(blobId, blobData, id = 1) {
-  const setArgs = Buffer.concat([
-    Buffer.from(encodeField(1, LEN, blobId)),
-    Buffer.from(encodeField(2, LEN, blobData)),
-  ]);
-  const kv = Buffer.concat([
-    Buffer.from(encodeField(1, VARINT, id)),
-    Buffer.from(encodeField(3, LEN, setArgs)),
-  ]);
-  return Buffer.from(wrapConnectRPCFrame(encodeField(4, LEN, kv)));
 }
 
 function stubAgentSession(executor, frames) {
@@ -165,13 +141,12 @@ function decodeMcpResultFrame(frame) {
   };
 }
 
-async function runAgent({ frames, stream, body, model = "gpt-5.2", modelCatalog }) {
+async function runAgent({ frames, stream, body, model = "gpt-5.2", modelCatalog, tools }) {
   const executor = new CursorExecutor();
   const written = stubAgentSession(executor, frames);
   const result = await executor.executeAgent({
     model,
-    body: body || { messages: [{ role: "user", content: "hi" }] },
-    stream,
+    body: body || { messages: [{ role: "user", content: "hi" }], ...(tools ? { tools } : {}) },    stream,
     credentials,
     modelCatalog,
   });
@@ -204,6 +179,56 @@ describe("CursorExecutor AgentService exec_request handling", () => {
     expect(requestedModel.get(3)).toHaveLength(2);
   });
 
+
+  for (const intent of [{ reasoning_effort: "high" }, { reasoning: { effort: "high" } }]) {
+    it(`passes ${Object.keys(intent)[0]} through the AgentService executor`, async () => {
+      const executor = new CursorExecutor();
+      const written = stubAgentSession(executor, [textFrame("hello"), turnEndedFrame()]);
+      const result = await executor.executeAgent({
+        model: "gpt-5.2", body: { messages: [{ role: "user", content: "hi" }], ...intent },
+        stream: false, credentials,
+      });
+      expect(result.response.status).toBe(200);
+      const run = decodeMessage(decodeMessage(written[0].subarray(5)).get(1)[0].value);
+      const requested = decodeMessage(run.get(9)[0].value);
+      const parameter = decodeMessage(requested.get(3)[0].value);
+      expect(Buffer.from(parameter.get(1)[0].value).toString()).toBe("reasoning");
+      expect(Buffer.from(parameter.get(2)[0].value).toString()).toBe("high");
+    });
+  }
+
+  for (const frames of [[], [turnEndedFrame()]]) {
+    it(`rejects an empty ${frames.length ? "explicit turn" : "EOF"} without a successful SSE stop`, async () => {
+      const { result } = await runAgent({ frames, stream: true });
+      const text = await result.response.text();
+      const events = parseSSE(text);
+      expect(events.filter((event) => event.error)).toHaveLength(1);
+      expect(events.some((event) => event.choices?.[0]?.finish_reason === "stop")).toBe(false);
+      expect(text.match(/data: \[DONE\]/g)).toHaveLength(1);
+    });
+
+    it(`rejects an empty ${frames.length ? "explicit turn" : "EOF"} for non-stream clients`, async () => {
+      const { result } = await runAgent({ frames, stream: false });
+      expect(result.response.status).toBe(400);
+      expect((await result.response.json()).error.message).toContain("empty turn");
+    });
+  }
+
+  it("does not emit successful completion when reading the stream fails", async () => {
+    const executor = new CursorExecutor();
+    const written = stubAgentSession(executor, []);
+    const open = executor.openAgentHttp2Stream;
+    executor.openAgentHttp2Stream = (...args) => ({
+      ...open(...args),
+      async read() { throw new Error("transport interrupted"); },
+    });
+    const { response } = await executor.executeAgent({
+      model: "gpt-5.2", body: { messages: [{ role: "user", content: "hi" }] },
+      stream: true, credentials,
+    });
+    await expect(response.text()).rejects.toThrow("transport interrupted");
+    expect(written).toHaveLength(1);
+  });
   it("acknowledges a request-context exec request without ending the turn", async () => {
     const { result, written } = await runAgent({
       frames: [execRequestFrame(10), textFrame("hello")],
@@ -216,30 +241,7 @@ describe("CursorExecutor AgentService exec_request handling", () => {
     expect(content).toBe("hello");
   });
 
-  it("copies request-context correlation fields and advertises tools in field 7", async () => {
-    const body = {
-      messages: [{ role: "user", content: "hi" }],
-      tools: [{ function: { name: "get_weather", parameters: { type: "object" } } }],
-    };
-    const { result, written } = await runAgent({
-      frames: [execRequestFrame(10, new Uint8Array(), { id: 42, execId: "exec-id" }), textFrame("ok")],
-      stream: true,
-      body,
-    });
-    await result.response.text();
-
-    const clientMessage = decodeMessage(written[1].subarray(5));
-    const execResponse = decodeMessage(clientMessage.get(2)[0].value);
-    expect(execResponse.get(1)[0].value).toBe(42);
-    expect(Buffer.from(execResponse.get(15)[0].value).toString()).toBe("exec-id");
-    const resultMessage = decodeMessage(execResponse.get(10)[0].value);
-    const success = decodeMessage(resultMessage.get(1)[0].value);
-    const context = decodeMessage(success.get(1)[0].value);
-    expect(context.has(7)).toBe(true);
-    expect(context.get(7)).toHaveLength(1);
-    expect(Buffer.from(decodeMessage(context.get(7)[0].value).get(1)[0].value).toString()).toBe("get_weather");
-  });
-
+  
   it("returns an empty MCP resource list and continues the turn", async () => {
     const spanContext = Buffer.concat([
       Buffer.from(encodeField(1, LEN, "a".repeat(32))),
@@ -598,32 +600,45 @@ describe("CursorExecutor AgentService exec_request handling", () => {
     expect(session.closeCount).toBe(1);
   });
 
+  it("does not echo client tools on the request_context ack", async () => {
+    const { written, result } = await runAgent({
+      tools: [{ function: { name: "read_file", parameters: { type: "object" } } }],
+      frames: [execRequestFrame(10), textFrame("hello")],
+      stream: true,
+    });
+
+    expect(written.length).toBe(2);
+    expect(written[1].toString("utf8")).not.toContain("read_file");
+    const content = parseSSE(await result.response.text())
+      .map((e) => e.choices?.[0]?.delta?.content || "")
+      .join("");
+    expect(content).toBe("hello");
+  });
+
   it("does not render an unsupported exec request as assistant content", async () => {
-    const { result } = await runAgent({
-      frames: [textFrame("partial answer"), execRequestFrame(2)],
+    const { result, written } = await runAgent({
+      frames: [textFrame("partial answer"), execRequestFrame(2), textFrame(" more")],
       stream: true,
     });
 
     const body = await result.response.text();
-    expect(body).not.toContain("unsupported IDE tool\\n");
+    expect(body).not.toContain("unsupported IDE tool");
     const events = parseSSE(body);
     const content = events.map((e) => e.choices?.[0]?.delta?.content || "").join("");
-    expect(content).toBe("partial answer");
-
-    const errorEvent = events.find((e) => e.error);
-    expect(errorEvent?.error?.message).toContain("unsupported IDE tool");
-    expect(events.some((e) => e.choices?.[0]?.finish_reason === "stop")).toBe(false);
+    expect(content).toBe("partial answer more");
+    expect(events.some((e) => e.error)).toBe(false);
+    expect(written.length).toBe(2); // run frame + IDE rejection
   });
 
-  it("drops frames batched behind an unsupported exec request in the same read", async () => {
+  it("still emits later text after rejecting an IDE exec in the same read", async () => {
     const { result } = await runAgent({
       frames: [Buffer.concat([execRequestFrame(2), textFrame("late")])],
       stream: true,
     });
 
     const body = await result.response.text();
-    expect(body).toContain("unsupported IDE tool");
-    expect(body).not.toContain("late");
+    expect(body).not.toContain("unsupported IDE tool");
+    expect(body).toContain("late");
   });
 
   it("returns a non-200 error body for an unsupported exec request when not streaming", async () => {
@@ -635,6 +650,166 @@ describe("CursorExecutor AgentService exec_request handling", () => {
     expect(result.response.status).not.toBe(200);
     const payload = await result.response.json();
     expect(payload.error.message).toContain("unsupported IDE tool");
+  });
+
+  it("streams Composer visible content from thinking_delta after </think>", async () => {
+    const { result } = await runAgent({
+      model: "composer-2.5",
+      frames: [
+        thinkingFrame("private reasoning that must not leak</think>OK"),
+        turnEndedFrame(),
+      ],
+      stream: true,
+    });
+
+    const events = parseSSE(await result.response.text());
+    const content = events.map((e) => e.choices?.[0]?.delta?.content || "").join("");
+    expect(content).toBe("OK");
+    expect(JSON.stringify(events)).not.toContain("private reasoning");
+  });
+
+  it("flushes Grok thinking as visible content when the turn has no text_delta", async () => {
+    const { result } = await runAgent({
+      model: "grok-4.5",
+      frames: [thinkingFrame("hello from grok"), turnEndedFrame()],
+      stream: true,
+    });
+
+    const events = parseSSE(await result.response.text());
+    const content = events.map((e) => e.choices?.[0]?.delta?.content || "").join("");
+    expect(content).toBe("hello from grok");
+  });
+});
+
+describe("Cursor long-session empty-turn recovery", () => {
+  // agent.v1.AgentClientMessage.run_request → conversation_action (2) →
+  // user_action (1) → conversation_history (7). Present = full replay frame.
+  function runFrameHasHistory(frame) {
+    const run = decodeMessage(decodeMessage(frame.subarray(5)).get(1)[0].value);
+    const userAction = decodeMessage(decodeMessage(run.get(2)[0].value).get(1)[0].value);
+    return userAction.has(7);
+  }
+
+  // 79 filler turns + the live user turn → threshold met by default (80).
+  const longBody = {
+    messages: [
+      ...Array.from({ length: 79 }, (_, i) => ({ role: "user", content: `m${i}` })),
+      { role: "user", content: "answer me" },
+    ],
+  };
+
+  function stubSequentialAgentSessions(executor, attempts) {
+    const writtenPerAttempt = [];
+    let call = 0;
+    executor.openAgentHttp2Stream = () => {
+      const frames = attempts[Math.min(call, attempts.length - 1)];
+      const written = [];
+      writtenPerAttempt.push(written);
+      const queue = [...frames];
+      call++;
+      return {
+        responseHeaders: Promise.resolve({ ":status": 200 }),
+        write: (frame) => written.push(Buffer.from(frame)),
+        end() {},
+        close() {},
+        async read() {
+          if (!queue.length) return { value: undefined, done: true };
+          return { value: queue.shift(), done: false };
+        },
+      };
+    };
+    return writtenPerAttempt;
+  }
+
+  it("retries a wedged long session once with a tail-only frame (streaming)", async () => {
+    const executor = new CursorExecutor();
+    const writtenPerAttempt = stubSequentialAgentSessions(executor, [
+      [],
+      [textFrame("recovered"), turnEndedFrame()],
+    ]);
+    const result = await executor.executeAgent({
+      model: "gpt-5.2", body: longBody, stream: true, credentials,
+    });
+
+    // Consumption (and therefore the retry) is lazy: drain the stream first.
+    const text = await result.response.text();
+    expect(writtenPerAttempt).toHaveLength(2);
+    // First attempt replays full history; the retry ships a tail-only frame.
+    expect(runFrameHasHistory(writtenPerAttempt[0][0])).toBe(true);
+    expect(runFrameHasHistory(writtenPerAttempt[1][0])).toBe(false);
+
+    const events = parseSSE(text);
+    const content = events.map((e) => e.choices?.[0]?.delta?.content || "").join("");
+    expect(content).toBe("recovered");
+    expect(events.filter((e) => e.error)).toHaveLength(0);
+    expect(events.filter((e) => e.choices?.[0]?.finish_reason === "stop")).toHaveLength(1);
+    expect(text.match(/data: \[DONE\]/g)).toHaveLength(1);
+  });
+
+  it("recovers a wedged long session for non-stream clients", async () => {
+    const executor = new CursorExecutor();
+    stubSequentialAgentSessions(executor, [
+      [],
+      [textFrame("ok"), turnEndedFrame()],
+    ]);
+    const result = await executor.executeAgent({
+      model: "gpt-5.2", body: longBody, stream: false, credentials,
+    });
+    expect(result.response.status).toBe(200);
+    const payload = await result.response.json();
+    expect(payload.choices[0].message.content).toBe("ok");
+  });
+
+  it("does not retry a short session — first-message empty stays an error", async () => {
+    const executor = new CursorExecutor();
+    const writtenPerAttempt = stubSequentialAgentSessions(executor, [[]]);
+    const result = await executor.executeAgent({
+      model: "gpt-5.2", body: { messages: [{ role: "user", content: "hi" }] },
+      stream: true, credentials,
+    });
+
+    expect(writtenPerAttempt).toHaveLength(1);
+    const text = await result.response.text();
+    const events = parseSSE(text);
+    expect(events.filter((e) => e.error)).toHaveLength(1);
+    expect(events.some((e) => e.choices?.[0]?.finish_reason === "stop")).toBe(false);
+  });
+
+  it("does not retry once real content has streamed", async () => {
+    const executor = new CursorExecutor();
+    // Content followed by EOF: the turn completes with what was emitted.
+    const writtenPerAttempt = stubSequentialAgentSessions(executor, [
+      [textFrame("partial")],
+    ]);
+    const result = await executor.executeAgent({
+      model: "gpt-5.2", body: longBody, stream: true, credentials,
+    });
+
+    expect(writtenPerAttempt).toHaveLength(1);
+    const events = parseSSE(await result.response.text());
+    const content = events.map((e) => e.choices?.[0]?.delta?.content || "").join("");
+    expect(content).toBe("partial");
+    expect(events.filter((e) => e.error)).toHaveLength(0);
+  });
+
+  it("tailOnlyCursorMessages keeps system, drops bulk history, keeps the live turn", async () => {
+    const { tailOnlyCursorMessages } = await import("../../open-sse/executors/cursor.js");
+    const messages = [
+      { role: "system", content: "be helpful" },
+      ...Array.from({ length: 90 }, (_, i) => ({ role: "user", content: `m${i}` })),
+      { role: "assistant", content: "working on it" },
+      { role: "tool", content: "result" },
+      { role: "user", content: "final ask" },
+    ];
+    const trimmed = tailOnlyCursorMessages(messages);
+    expect(trimmed[0]).toEqual({ role: "system", content: "be helpful" });
+    expect(trimmed).toHaveLength(3);
+    expect(trimmed[1].content).toContain("94 messages trimmed");
+    expect(trimmed[2].content).toBe("final ask");
+
+    // Idempotent: prior [9router] notes are stripped on re-trim.
+    const again = tailOnlyCursorMessages(trimmed);
+    expect(again.filter((m) => String(m.content).includes("[9router]"))).toHaveLength(1);
   });
 });
 
