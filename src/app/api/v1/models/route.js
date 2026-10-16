@@ -396,9 +396,6 @@ export async function buildModelsList(kindFilter, options = {}) {
   // Lookup map so aggregateComboCapabilities can recursively resolve nested combos
   const comboByName = Object.fromEntries(combos.map((c) => [c.name, c.models]));
 
-  // Lookup map so aggregateComboCapabilities can recursively resolve nested combos
-  const comboByName = Object.fromEntries(combos.map((c) => [c.name, c.models]));
-
   // Combos first (filtered by kind). Web combos expose `kind` so AI knows search vs fetch.
   for (const combo of combos) {
     if (!comboMatchesKinds(combo, kindFilter)) continue;
