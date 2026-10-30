@@ -57,10 +57,11 @@ describe("AUDIT-002: API key masking", () => {
       path.resolve(REPO_ROOT, "src/lib/db/repos/usageRepo.js"),
       "utf-8"
     );
-    // The 24h path should use apiKeyMasked in the akKey template
-    expect(source).toContain("${apiKeyMasked}|${r.model}|${r.provider");
-    // Should NOT use raw r.apiKey in the key
-    expect(source).not.toContain("${r.apiKey}|${r.model}|${r.provider");
+    // The 24h path keys by the FULL api key (4a57df8b): masking collided all
+    // team keys sharing a machine-id prefix into one bucket.
+    expect(source).toContain("${r.apiKey}|${r.model}|${r.provider");
+    // Should NOT key by the masked value
+    expect(source).not.toContain("${apiKeyMasked}|${r.model}|${r.provider");
   });
 });
 
